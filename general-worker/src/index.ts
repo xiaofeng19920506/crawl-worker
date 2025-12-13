@@ -669,38 +669,44 @@ const navigateToEncoreQueue = async (page: Page, retryCount = 0): Promise<void> 
 const openBatchOfTabs = async (targetContext: BrowserContext, batchStart: number, batchEnd: number, totalPages: number, tabsOpenedSoFar: number): Promise<number> => {
   logger.info({ batchStart, batchEnd, totalPages }, "Opening batch of page tabs");
   
-  // Open all tabs in parallel - wait for tabs to be created (but not for navigation to complete)
+  // Open tabs sequentially with random delay between each tab for more human-like behavior
   const startTime = Date.now();
-  const tabPromises: Promise<void>[] = [];
+  const batchSize = batchEnd - batchStart + 1;
+  
+  // Get delay range from config (Zod schema provides defaults, so no fallback needed)
+  const minDelay = config.TAB_OPEN_DELAY_MIN_MS;
+  const maxDelay = config.TAB_OPEN_DELAY_MAX_MS;
+  
+  // Ensure max >= min
+  const delayMax = Math.max(minDelay, maxDelay);
+  const delayMin = Math.min(minDelay, maxDelay);
   
   for (let pageNum = batchStart; pageNum <= batchEnd; pageNum++) {
-    const tabPromise = (async () => {
-      try {
-        const encoreUrl = `${config.AMAZON_VINE_ENCORE_URL}&page=${pageNum}`;
-        const tab = await targetContext.newPage();
-        
-        // Navigate with minimal wait - just commit, don't wait for full load
-        tab.goto(encoreUrl, { 
-          waitUntil: "commit", // Fastest option - just wait for navigation to commit
-          timeout: 30000 
-        }).catch(() => {
-          // Navigation continues in background - non-blocking
-        });
-      } catch (error: any) {
-        // Log error but continue
-        logger.warn({ error: error.message, pageNum }, "Failed to open tab");
+    try {
+      // Add random delay before opening each tab (except the first one)
+      if (pageNum > batchStart) {
+        const randomDelay = Math.floor(Math.random() * (delayMax - delayMin + 1)) + delayMin;
+        await delay(randomDelay);
       }
-    })();
-    
-    tabPromises.push(tabPromise);
+      
+      const encoreUrl = `${config.AMAZON_VINE_ENCORE_URL}&page=${pageNum}`;
+      const tab = await targetContext.newPage();
+      
+      // Navigate with minimal wait - just commit, don't wait for full load
+      tab.goto(encoreUrl, { 
+        waitUntil: "commit", // Fastest option - just wait for navigation to commit
+        timeout: 30000 
+      }).catch(() => {
+        // Navigation continues in background - non-blocking
+      });
+    } catch (error: any) {
+      // Log error but continue
+      logger.warn({ error: error.message, pageNum }, "Failed to open tab");
+    }
   }
   
-  // Wait for all tabs to be created (but navigation continues in background)
-  await Promise.all(tabPromises);
-  
   const elapsed = Date.now() - startTime;
-  const batchSize = batchEnd - batchStart + 1;
-  logger.info({ elapsed, batchSize, tabsCreated: batchSize }, "✅ All tabs created in batch");
+  logger.info({ elapsed, batchSize, tabsCreated: batchSize, delayRange: `${delayMin}-${delayMax}ms` }, "✅ All tabs created in batch");
   
   return batchSize;
 };

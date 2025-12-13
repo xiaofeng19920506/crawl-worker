@@ -52,6 +52,19 @@ const configSchema = z.object({
     .nonnegative()
     .default(20), // 20ms delay between tab openings
   
+  // Random delay between opening tabs in a batch (for more human-like behavior)
+  TAB_OPEN_DELAY_MIN_MS: z.coerce
+    .number()
+    .int()
+    .nonnegative()
+    .default(50)
+    .describe("Minimum random delay (ms) between opening tabs in a batch"),
+  TAB_OPEN_DELAY_MAX_MS: z.coerce
+    .number()
+    .int()
+    .nonnegative()
+    .default(200)
+    .describe("Maximum random delay (ms) between opening tabs in a batch"),
   
   // Worker configuration
   PRODUCT_WORKER_ID: z.coerce.number().int().positive().optional(),
