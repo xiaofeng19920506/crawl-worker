@@ -1,0 +1,69 @@
+// This is your Prisma schema file,
+// learn more about it in the docs: https://pris.ly/d/prisma-schema
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "mysql"
+  url      = env("DATABASE_URL")
+}
+
+model Product {
+  asin           String   @id @db.VarChar(10)
+  url            String   @db.Text
+  title          String   @db.Text
+  pageNumber     Int      @map("page_number")
+  images         Json     // MySQL 5.7+ supports JSON type
+  priceCents     Int?     @map("price_cents")
+  currencyCode   String?  @map("currency_code") @db.VarChar(3)
+  rating         Decimal? @db.Decimal(3, 2) // Store rating as DECIMAL(3,2) for precision
+  ratingCount    Int?     @map("rating_count")
+  brand          String?  @db.Text
+  description    String?  @db.Text
+  category       String?  @db.Text
+  availability   String?  @db.VarChar(100)
+  primeEligible  Boolean? @map("prime_eligible") @default(false)
+  discount       String?  @db.VarChar(50)
+  originalPrice  Int?     @map("original_price")
+  vineNote       String?  @map("vine_note") @db.Text
+  createdAt      DateTime @default(now()) @map("created_at") @db.DateTime(6)
+  updatedAt      DateTime @updatedAt @map("updated_at") @db.DateTime(6)
+
+  crawlEvents ProductCrawlEvent[]
+
+  @@map("products")
+  @@index([pageNumber])
+  @@index([createdAt])
+  @@index([updatedAt])
+  @@index([asin])
+}
+
+model ProductCrawlEvent {
+  id         Int      @id @default(autoincrement())
+  asin       String?  @db.VarChar(10)
+  url        String   @db.Text
+  pageNumber Int      @map("page_number")
+  status     String   @db.VarChar(20) // 'success' | 'failed'
+  error      String?  @db.Text
+  createdAt  DateTime @default(now()) @map("created_at") @db.DateTime(6)
+
+  product Product? @relation(fields: [asin], references: [asin])
+
+  @@map("product_crawl_events")
+  @@index([asin])
+  @@index([status])
+  @@index([pageNumber])
+  @@index([createdAt])
+}
+
+model CrawlMetadata {
+  id            Int      @id @default(autoincrement())
+  totalPages    Int      @map("total_pages")
+  totalProducts Int      @map("total_products")
+  lastUpdated   DateTime @default(now()) @updatedAt @map("last_updated") @db.DateTime(6)
+
+  @@map("crawl_metadata")
+}
+

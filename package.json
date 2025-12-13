@@ -1,0 +1,36 @@
+{
+  "name": "vine-crawler",
+  "version": "1.0.0",
+  "description": "Amazon Vine Crawler - Restructured",
+  "type": "module",
+  "scripts": {
+    "build": "npm run build --workspaces",
+    "start:manager-worker": "tsx manager-worker/src/index.ts",
+    "start:general-worker": "tsx general-worker/src/index.ts",
+    "start:product-worker": "tsx product-worker/src/index.ts",
+    "start:api": "tsx api/src/index.ts",
+    "start:manager-api": "concurrently -n manager,api -c blue,green \"npm run start:manager-worker\" \"npm run start:api\"",
+    "dev:manager-worker": "tsx watch manager-worker/src/index.ts",
+    "dev:general-worker": "tsx watch general-worker/src/index.ts",
+    "dev:product-worker": "tsx watch product-worker/src/index.ts",
+    "dev:api": "tsx watch api/src/index.ts",
+    "dev:manager-api": "concurrently -n manager,api -c blue,green \"npm run dev:manager-worker\" \"npm run dev:api\""
+  },
+  "workspaces": [
+    "manager-worker",
+    "general-worker",
+    "product-worker",
+    "api",
+    "shared"
+  ],
+  "devDependencies": {
+    "@types/node": "^20.12.12",
+    "concurrently": "^8.2.2",
+    "tsx": "^4.19.0",
+    "typescript": "^5.3.3"
+  },
+  "engines": {
+    "node": ">=18.18.0"
+  }
+}
+

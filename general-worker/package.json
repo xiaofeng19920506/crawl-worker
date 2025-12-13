@@ -1,0 +1,17 @@
+{
+  "name": "general-worker",
+  "version": "1.0.0",
+  "type": "module",
+  "main": "src/index.ts",
+  "dependencies": {
+    "bullmq": "^5.12.7",
+    "playwright": "^1.48.0",
+    "shared": "*"
+  },
+  "devDependencies": {
+    "@types/node": "^20.12.12",
+    "tsx": "^4.19.0",
+    "typescript": "^5.3.3"
+  }
+}
+
