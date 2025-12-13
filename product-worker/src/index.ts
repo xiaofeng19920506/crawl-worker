@@ -124,6 +124,20 @@ const getBrowser = async (): Promise<Browser> => {
     viewport: { width: 1920, height: 1080 },
   };
   
+  // Add proxy configuration if enabled
+  if (config.USE_PROXY && config.PROXY_SERVER) {
+    launchOptions.proxy = {
+      server: config.PROXY_SERVER,
+    };
+    
+    if (config.PROXY_USERNAME && config.PROXY_PASSWORD) {
+      launchOptions.proxy.username = config.PROXY_USERNAME;
+      launchOptions.proxy.password = config.PROXY_PASSWORD;
+    }
+    
+    logger.info({ proxy: config.PROXY_SERVER }, "Using proxy for browser");
+  }
+  
   // Only add executablePath if provided (for local Chrome)
   if (chromePath) {
     launchOptions.executablePath = chromePath;
@@ -955,8 +969,136 @@ const checkAndCrawlIfNeeded = async (): Promise<void> => {
   }
 };
 
+const checkForDuplicateWorker = async (workerId: number): Promise<{ hasDuplicate: boolean; lockValue?: string }> => {
+  try {
+    const lockKey = REDIS_KEY_WORKER_LOCK("product", workerId);
+    const lockValue = Date.now().toString();
+    const LOCK_TTL_SECONDS = 60; // Lock expires after 60 seconds (allows recovery from crashes)
+    
+    // Atomic operation: SET if Not eXists with EXpiration
+    // Returns "OK" if lock was acquired, null if lock already exists
+    const result = await redisConnection.set(lockKey, lockValue, "EX", LOCK_TTL_SECONDS, "NX");
+    
+    if (result === "OK") {
+      // Successfully acquired the lock atomically
+      return { hasDuplicate: false, lockValue }; // Return lock value for later verification
+    }
+    
+    // Lock already exists - check if it's stale (from a crashed worker)
+    const existingLock = await redisConnection.get(lockKey);
+    if (existingLock) {
+      const lockTime = parseInt(existingLock, 10);
+      const now = Date.now();
+      // If lock is older than 30 seconds, assume previous worker crashed
+      if (now - lockTime < 30000) {
+        logger.error({ workerId, existingLockTime: new Date(lockTime).toISOString() }, "❌ Another Product Worker with the same ID is already running!");
+        logger.error({ workerId }, "Please stop the duplicate worker or use a different PRODUCT_WORKER_ID");
+        return { hasDuplicate: true }; // Duplicate found
+      }
+      
+      // Lock is stale (older than 30 seconds) - try to acquire it
+      // Use GETSET to atomically get old value and set new value
+      const oldValue = await redisConnection.getset(lockKey, lockValue);
+      if (oldValue === existingLock) {
+        // Successfully acquired stale lock
+        await redisConnection.expire(lockKey, LOCK_TTL_SECONDS);
+        return { hasDuplicate: false, lockValue }; // Return lock value for later verification
+      } else if (oldValue === null) {
+        // Lock expired between GET and GETSET - retry with SET NX
+        const retryResult = await redisConnection.set(lockKey, lockValue, "EX", LOCK_TTL_SECONDS, "NX");
+        if (retryResult === "OK") {
+          return { hasDuplicate: false, lockValue }; // Return lock value for later verification
+        }
+        // Another process acquired it during retry - check if it's a real duplicate
+        const newLock = await redisConnection.get(lockKey);
+        if (newLock) {
+          const newLockTime = parseInt(newLock, 10);
+          const now = Date.now();
+          if (now - newLockTime < 30000) {
+            // New lock is recent - real duplicate
+            logger.error({ workerId }, "❌ Another Product Worker with the same ID is already running!");
+            return { hasDuplicate: true }; // Duplicate found
+          }
+        }
+        // Lock is still stale or doesn't exist - try one more time
+        const finalRetry = await redisConnection.set(lockKey, lockValue, "EX", LOCK_TTL_SECONDS, "NX");
+        if (finalRetry === "OK") {
+          return { hasDuplicate: false, lockValue }; // Return lock value for later verification
+        }
+        logger.error({ workerId }, "❌ Another Product Worker with the same ID is already running!");
+        return { hasDuplicate: true }; // Duplicate found
+      } else {
+        // oldValue is different from existingLock - lock was modified
+        // Could be another process or lock refresh - check if it's recent
+        const newLockTime = parseInt(oldValue, 10);
+        const now = Date.now();
+        if (now - newLockTime < 30000) {
+          // New lock is recent - real duplicate
+          logger.error({ workerId }, "❌ Another Product Worker with the same ID is already running!");
+          return { hasDuplicate: true }; // Duplicate found
+        }
+        // New lock is also stale - retry with SET NX
+        const retryResult = await redisConnection.set(lockKey, lockValue, "EX", LOCK_TTL_SECONDS, "NX");
+        if (retryResult === "OK") {
+          return { hasDuplicate: false, lockValue }; // Return lock value for later verification
+        }
+        logger.error({ workerId }, "❌ Another Product Worker with the same ID is already running!");
+        return { hasDuplicate: true }; // Duplicate found
+      }
+    }
+    
+    // Lock doesn't exist (expired between SET NX and GET) - try again
+    const retryResult = await redisConnection.set(lockKey, lockValue, "EX", LOCK_TTL_SECONDS, "NX");
+    if (retryResult === "OK") {
+      return { hasDuplicate: false, lockValue }; // Return lock value for later verification
+    }
+    
+    // Still couldn't acquire - another worker must have started
+    logger.error({ workerId }, "❌ Another Product Worker with the same ID is already running!");
+    return { hasDuplicate: true }; // Duplicate found
+  } catch (error) {
+    logger.warn({ error, workerId }, "Failed to check for duplicate worker, continuing anyway");
+    return { hasDuplicate: false }; // Continue on error (no lock value to verify)
+  }
+};
+
 const main = async (): Promise<void> => {
   const workerId = config.PRODUCT_WORKER_ID || 1;
+  
+  // Check for duplicate worker before starting
+  const duplicateCheck = await checkForDuplicateWorker(workerId);
+  if (duplicateCheck.hasDuplicate) {
+    process.exit(1);
+  }
+  
+  // Store the lock value we acquired for verification during refresh
+  let ourLockValue = duplicateCheck.lockValue;
+  
+  // If lock value wasn't returned (e.g., due to error in checkForDuplicateWorker),
+  // try to retrieve it from Redis to ensure lastRefreshTime matches the actual lock timestamp
+  if (!ourLockValue) {
+    try {
+      const lockKey = REDIS_KEY_WORKER_LOCK("product", workerId);
+      const lockFromRedis = await redisConnection.get(lockKey);
+      if (lockFromRedis) {
+        ourLockValue = lockFromRedis;
+        logger.info({ workerId }, "Retrieved lock value from Redis after duplicate check error");
+      } else {
+        // Lock doesn't exist in Redis - we can't verify we own it
+        // Fail-fast to prevent running without proper duplicate prevention
+        logger.error({ workerId }, "❌ Cannot verify lock acquisition - lock not found in Redis");
+        logger.error({ workerId }, "Worker cannot proceed without verified lock ownership. Exiting to prevent duplicate workers.");
+        process.exit(1);
+      }
+    } catch (error) {
+      // Redis retrieval failed - we can't verify lock ownership
+      // Fail-fast to prevent running without proper duplicate prevention
+      logger.error({ error, workerId }, "❌ Failed to retrieve lock value from Redis");
+      logger.error({ workerId }, "Worker cannot proceed without verified lock ownership. Exiting to prevent duplicate workers.");
+      process.exit(1);
+    }
+  }
+  
   logger.info({ workerId }, `🚀 Product Worker #${workerId} starting...`);
 
   try {
@@ -972,13 +1114,89 @@ const main = async (): Promise<void> => {
     const POLL_INTERVAL = 2000; // 2 seconds - check frequently for new assignments
     const HEARTBEAT_INTERVAL = 10000; // 10 seconds - send heartbeat
     let isProcessing = false; // Prevent concurrent processing
-    const workerId = config.PRODUCT_WORKER_ID || 1;
+    
+    // Refresh lock to prevent expiration while worker is running
+    const LOCK_TTL_SECONDS = 60; // Lock TTL matches the one used in checkForDuplicateWorker
+    
+    // Track last successful refresh time to detect if lock was stolen
+    // Use the actual lock value from Redis to ensure it matches what's stored
+    let lastRefreshTime = ourLockValue ? parseInt(ourLockValue, 10) : Date.now();
+    
+    const refreshLock = async (): Promise<void> => {
+      try {
+        const lockKey = REDIS_KEY_WORKER_LOCK("product", workerId);
+        const now = Date.now();
+        
+        // Get current lock value to verify we still own it
+        const currentLock = await redisConnection.get(lockKey);
+        
+        if (!currentLock) {
+          // Lock doesn't exist - we no longer own it (expired or released)
+          logger.debug({ workerId }, "Lock doesn't exist - not refreshing");
+          return;
+        }
+        
+        const currentLockTime = parseInt(currentLock, 10);
+        
+        // Validate that currentLockTime is a valid number
+        // If Redis contains invalid data, parseInt returns NaN, which breaks ownership verification
+        if (isNaN(currentLockTime)) {
+          logger.warn({ workerId, invalidLockValue: currentLock }, "Lock value is not a valid number - not refreshing");
+          return;
+        }
+        
+        // Verify ownership: current lock should be close to our last refresh time
+        // Since we refresh every 10 seconds (HEARTBEAT_INTERVAL), the lock value should be
+        // within 15-20 seconds of our last refresh. A larger gap indicates another worker acquired it.
+        // Use a tight threshold (20 seconds) to detect lock theft quickly
+        const LOCK_OWNERSHIP_THRESHOLD_MS = 20000; // 20 seconds - tighter than TTL to catch theft early
+        if (Math.abs(currentLockTime - lastRefreshTime) > LOCK_OWNERSHIP_THRESHOLD_MS) {
+          logger.warn({ workerId, lastRefreshTime, currentLockTime, diff: Math.abs(currentLockTime - lastRefreshTime) }, "Lock appears to be from another worker - not refreshing");
+          return;
+        }
+        
+        // We still own the lock - refresh it atomically using GETSET
+        const newLockValue = now.toString();
+        const oldValue = await redisConnection.getset(lockKey, newLockValue);
+        
+        // Check if lock expired between GET and GETSET (oldValue is null)
+        if (oldValue === null) {
+          // Lock expired between GET and GETSET - we no longer own it
+          // Another worker may have acquired it or it expired
+          logger.warn({ workerId, expected: currentLock }, "Lock expired during refresh (GETSET returned null) - lock lost");
+          return;
+        }
+        
+        // Verify the old value matches what we expected
+        // If oldValue doesn't match currentLock, another worker modified it
+        if (oldValue !== currentLock) {
+          // Lock was modified by another worker between GET and GETSET - revert our change
+          await redisConnection.set(lockKey, oldValue, "EX", LOCK_TTL_SECONDS);
+          logger.warn({ workerId, expected: currentLock, actual: oldValue }, "Lock was modified by another worker during refresh - reverted");
+          return;
+        }
+        
+        // At this point, oldValue === currentLock, so they are identical
+        // No need to check timestamp mismatch since they're the same value
+        
+        // Successfully refreshed - update our tracking
+        // Note: GETSET already updated the lock value to newLockValue (now.toString())
+        // Now we need to ensure the TTL is refreshed atomically
+        // Use SET with EX to update both value and TTL atomically (though GETSET already set the value)
+        await redisConnection.set(lockKey, newLockValue, "EX", LOCK_TTL_SECONDS);
+        lastRefreshTime = now;
+      } catch (error) {
+        // Don't log lock refresh errors - they're not critical
+      }
+    };
     
     // Send heartbeat to Redis so general worker knows this worker is alive
     const sendHeartbeat = async () => {
       try {
         const now = Date.now();
         await redisConnection.set(REDIS_KEY_WORKER_HEARTBEAT(workerId), now.toString());
+        // Refresh lock to prevent expiration while worker is running
+        await refreshLock();
       } catch (error) {
         // Don't log heartbeat errors - they're not critical
       }

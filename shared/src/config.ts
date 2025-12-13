@@ -60,6 +60,23 @@ const configSchema = z.object({
   GENERAL_WORKER_TOTAL: z.coerce.number().int().positive().optional(),
   TABS_PER_BATCH: z.coerce.number().int().positive().default(50), // Configurable batch size
   TABS_PER_BATCH_PER_WORKER: z.coerce.number().int().positive().default(25), // Tabs each general worker opens per batch
+  ROTATION_BATCH_SIZE: z.coerce.number().int().positive().default(50).describe("Number of pages to assign per rotation cycle"), // Pages per rotation cycle
+  ENABLE_ROUND_ROBIN_ROTATION: z
+    .string()
+    .transform((value) => value.toLowerCase() === "true" || value === "1")
+    .or(z.boolean())
+    .default(false)
+    .describe("Enable round-robin IP rotation (Server 1 → 2 → 3 → 1)"),
+
+  // Proxy configuration (for IP rotation)
+  USE_PROXY: z
+    .string()
+    .transform((value) => value.toLowerCase() === "true" || value === "1")
+    .or(z.boolean())
+    .default(false),
+  PROXY_SERVER: z.string().optional().describe("Proxy server URL (e.g., http://proxy.example.com:8080)"),
+  PROXY_USERNAME: z.string().optional(),
+  PROXY_PASSWORD: z.string().optional(),
 
   // Logging
   LOG_LEVEL: z.string().default("info"),
