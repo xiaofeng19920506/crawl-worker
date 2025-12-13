@@ -21,6 +21,9 @@ import {
   REDIS_KEY_WORKER_PAGES,
   REDIS_KEY_WORKER_COMPLETE,
   REDIS_KEY_WORKER_HEARTBEAT,
+  REDIS_KEY_AMAZON_COOKIES,
+  REDIS_KEY_AMAZON_SESSION_VALID,
+  REDIS_KEY_WORKER_LOCK,
 } from "shared";
 import { Job } from "bullmq";
 import { setTimeout as delay } from "node:timers/promises";
@@ -136,8 +139,58 @@ const getBrowser = async (): Promise<Browser> => {
   if (!browser) {
     throw new Error("Failed to get browser from persistent context");
   }
+  
+  // Load shared cookies immediately after creating context (for different servers)
+  await loadSharedCookies(context).catch(() => {
+    logger.debug("No shared cookies available yet, will load on first login");
+  });
+  
   logger.info("Successfully launched new browser");
   return browser;
+};
+
+const loadSharedCookies = async (targetContext: BrowserContext): Promise<boolean> => {
+  try {
+    const cookiesStr = await redisConnection.get(REDIS_KEY_AMAZON_COOKIES);
+    if (!cookiesStr) {
+      logger.debug("No shared cookies found in Redis");
+      return false;
+    }
+    
+    const cookies = JSON.parse(cookiesStr);
+    if (!Array.isArray(cookies) || cookies.length === 0) {
+      logger.debug("Invalid or empty cookies in Redis");
+      return false;
+    }
+    
+    // Check if session is still valid
+    const sessionValid = await redisConnection.get(REDIS_KEY_AMAZON_SESSION_VALID);
+    if (sessionValid !== "1") {
+      logger.debug("Session marked as invalid, not loading cookies");
+      return false;
+    }
+    
+    // Add cookies to context
+    await targetContext.addCookies(cookies);
+    logger.info({ cookieCount: cookies.length }, "✅ Loaded shared cookies from Redis");
+    return true;
+  } catch (error) {
+    logger.warn({ error }, "Failed to load shared cookies, will login normally");
+    return false;
+  }
+};
+
+const saveSharedCookies = async (targetContext: BrowserContext): Promise<void> => {
+  try {
+    const cookies = await targetContext.cookies();
+    if (cookies.length > 0) {
+      await redisConnection.set(REDIS_KEY_AMAZON_COOKIES, JSON.stringify(cookies));
+      await redisConnection.set(REDIS_KEY_AMAZON_SESSION_VALID, "1");
+      logger.info({ cookieCount: cookies.length }, "✅ Saved cookies to Redis for sharing");
+    }
+  } catch (error) {
+    logger.warn({ error }, "Failed to save cookies to Redis");
+  }
 };
 
 const getOrCreatePage = async (tabId: string): Promise<Page> => {
@@ -153,6 +206,8 @@ const getOrCreatePage = async (tabId: string): Promise<Page> => {
   let page: Page;
 
   if (context) {
+    // Try to load shared cookies if available
+    await loadSharedCookies(context).catch(() => {});
     page = await context.newPage();
   } else {
     // For CDP connections, try to use existing context or create new one
@@ -161,10 +216,14 @@ const getOrCreatePage = async (tabId: string): Promise<Page> => {
     
     if (contexts.length > 0) {
       targetContext = contexts[0];
+      // Try to load shared cookies if available
+      await loadSharedCookies(targetContext).catch(() => {});
     } else {
       targetContext = await browserInstance.newContext({
         viewport: { width: 1920, height: 1080 },
       });
+      // Try to load shared cookies if available
+      await loadSharedCookies(targetContext).catch(() => {});
     }
     
     page = await targetContext.newPage();
@@ -199,12 +258,36 @@ const isSignedIn = async (page: Page): Promise<boolean> => {
 };
 
 const ensureLoggedIn = async (page: Page): Promise<void> => {
+  const workerId = config.PRODUCT_WORKER_ID || 1;
+  
+  // Try to load shared cookies first (if available)
+  const targetContext = page.context();
+  const cookiesLoaded = await loadSharedCookies(targetContext);
+  
+  if (cookiesLoaded) {
+    // Try navigating with shared cookies
+    logger.info({ workerId }, "Using shared cookies, checking if session is valid...");
+    await page.goto(config.AMAZON_VINE_ENCORE_URL, { waitUntil: "domcontentloaded", timeout: 60000 });
+    await new Promise((resolve) => setTimeout(resolve, 3000));
+    
+    const signedIn = await isSignedIn(page);
+    if (signedIn) {
+      logger.info({ workerId }, "✅ Logged in successfully using shared cookies");
+      return; // Success with shared cookies
+    } else {
+      logger.warn({ workerId }, "Shared cookies invalid, will login normally");
+      await redisConnection.set(REDIS_KEY_AMAZON_SESSION_VALID, "0"); // Mark session as invalid
+    }
+  }
+  
   // Check if we're already on an Amazon page and logged in
   const currentUrl = page.url();
   if (currentUrl.includes("amazon.com") && !currentUrl.includes("/ap/signin") && !currentUrl.includes("/signin")) {
     const signedIn = await isSignedIn(page);
     if (signedIn) {
-      logger.info("Already logged in on current page");
+      logger.info({ workerId }, "Already logged in on current page");
+      // Save cookies for sharing
+      await saveSharedCookies(targetContext);
       return;
     }
   }
@@ -216,17 +299,20 @@ const ensureLoggedIn = async (page: Page): Promise<void> => {
   // Check if we were redirected to sign-in
   const newUrl = page.url();
   if (newUrl.includes("/ap/signin") || newUrl.includes("/signin")) {
-    logger.error({ currentUrl: newUrl }, "Not logged in - redirected to sign-in page");
-    throw new Error("Not logged in. Please log in via VNC at http://localhost:6080/vnc.html");
+    logger.error({ currentUrl: newUrl, workerId }, "Not logged in - redirected to sign-in page");
+    throw new Error("Not logged in. Please log in manually or wait for session to be shared.");
   }
 
   const signedIn = await isSignedIn(page);
   if (!signedIn) {
-    logger.error({ currentUrl: page.url() }, "Not logged in. Please log in via VNC.");
-    throw new Error("Not logged in. Please log in via VNC at http://localhost:6080/vnc.html");
+    logger.error({ currentUrl: page.url(), workerId }, "Not logged in. Please log in manually or wait for session to be shared.");
+    throw new Error("Not logged in. Please log in manually or wait for session to be shared.");
   }
   
-  logger.info("Login verified");
+  logger.info({ workerId }, "✅ Login verified");
+  
+  // Save cookies to Redis for other workers to use
+  await saveSharedCookies(targetContext);
 };
 
 const extractProductsFromPage = async (page: Page, pageNumber: number): Promise<any[]> => {
@@ -870,7 +956,8 @@ const checkAndCrawlIfNeeded = async (): Promise<void> => {
 };
 
 const main = async (): Promise<void> => {
-  logger.info("Product worker starting...");
+  const workerId = config.PRODUCT_WORKER_ID || 1;
+  logger.info({ workerId }, `🚀 Product Worker #${workerId} starting...`);
 
   try {
     // Initialize browser
@@ -952,6 +1039,13 @@ const main = async (): Promise<void> => {
       // Clear worker pages assignment
       try {
         await redisConnection.del(REDIS_KEY_WORKER_PAGES(workerId));
+      } catch {
+        // Ignore errors
+      }
+      
+      // Release worker lock
+      try {
+        await redisConnection.del(REDIS_KEY_WORKER_LOCK("product", workerId));
       } catch {
         // Ignore errors
       }

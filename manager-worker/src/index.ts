@@ -1,4 +1,4 @@
-import { config, logger, redisConnection, REDIS_KEY_TOTAL_PAGES, REDIS_KEY_TOTAL_PRODUCTS, REDIS_KEY_GENERAL_WORKER_HEARTBEAT, REDIS_KEY_GENERAL_WORKER_PAGES, REDIS_KEY_GENERAL_WORKER_COMPLETE, REDIS_KEY_MANAGER_TRIGGER } from "shared";
+import { config, logger, redisConnection, REDIS_KEY_TOTAL_PAGES, REDIS_KEY_TOTAL_PRODUCTS, REDIS_KEY_GENERAL_WORKER_HEARTBEAT, REDIS_KEY_GENERAL_WORKER_PAGES, REDIS_KEY_GENERAL_WORKER_COMPLETE, REDIS_KEY_GENERAL_WORKER_PROCESSING, REDIS_KEY_MANAGER_TRIGGER, REDIS_KEY_WORKER_LOCK } from "shared";
 import { setTimeout as delay } from "node:timers/promises";
 
 // Manager worker - controls and assigns work to general workers
@@ -88,6 +88,13 @@ const checkAndAssignWork = async (): Promise<void> => {
         break;
       }
       
+      // Check if worker is currently processing (don't reassign if processing)
+      const processingStr = await redisConnection.get(REDIS_KEY_GENERAL_WORKER_PROCESSING(workerId));
+      if (processingStr === "1") {
+        logger.debug({ workerId }, "Worker is currently processing, skipping reassignment");
+        continue; // Don't reassign if worker is processing
+      }
+      
       // Check if worker has completed its assigned range
       const completeStr = await redisConnection.get(REDIS_KEY_GENERAL_WORKER_COMPLETE(workerId));
       if (completeStr === "1") {
@@ -114,7 +121,29 @@ const checkAndAssignWork = async (): Promise<void> => {
 };
 
 const main = async (): Promise<void> => {
-  logger.info("Manager worker starting...");
+  // Check for duplicate manager worker (only one manager should run)
+  try {
+    const lockKey = REDIS_KEY_WORKER_LOCK("manager", 1);
+    const existingLock = await redisConnection.get(lockKey);
+    
+    if (existingLock) {
+      const lockTime = parseInt(existingLock, 10);
+      const now = Date.now();
+      // If lock is older than 30 seconds, assume previous manager crashed
+      if (now - lockTime < 30000) {
+        logger.error({ existingLockTime: new Date(lockTime).toISOString() }, "❌ Another Manager Worker is already running!");
+        logger.error("Please stop the duplicate manager worker");
+        process.exit(1);
+      }
+    }
+    
+    // Set lock with current timestamp
+    await redisConnection.set(lockKey, Date.now().toString());
+  } catch (error) {
+    logger.warn({ error }, "Failed to check for duplicate manager, continuing anyway");
+  }
+  
+  logger.info("🚀 Manager Worker starting...");
   logger.info("Standalone manager - detects active general workers and assigns page ranges to them");
   logger.info({ redisUrl: config.REDIS_URL }, "Connecting to Redis for coordination");
   
@@ -157,6 +186,7 @@ const main = async (): Promise<void> => {
   const shutdown = async (): Promise<void> => {
     logger.info("Manager worker shutting down gracefully");
     try {
+      await redisConnection.del(REDIS_KEY_WORKER_LOCK("manager", 1)); // Release lock
       await redisConnection.quit();
     } catch (error) {
       // Ignore errors on shutdown

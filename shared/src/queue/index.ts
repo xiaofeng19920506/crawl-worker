@@ -30,7 +30,11 @@ export const REDIS_KEY_ASSIGNED_PAGES = "vine:assigned-pages"; // Pages currentl
 export const REDIS_KEY_GENERAL_WORKER_HEARTBEAT = (workerId: number) => `vine:general-worker-${workerId}-heartbeat`; // General worker heartbeat timestamp
 export const REDIS_KEY_GENERAL_WORKER_PAGES = (workerId: number) => `vine:general-worker-${workerId}-pages`; // Page range assigned to a general worker (JSON: {start, end})
 export const REDIS_KEY_GENERAL_WORKER_COMPLETE = (workerId: number) => `vine:general-worker-${workerId}-complete`; // General worker completion status
+export const REDIS_KEY_GENERAL_WORKER_PROCESSING = (workerId: number) => `vine:general-worker-${workerId}-processing`; // General worker processing lock
 export const REDIS_KEY_MANAGER_TRIGGER = "vine:manager-trigger"; // Trigger for manager to assign work
+export const REDIS_KEY_AMAZON_COOKIES = "vine:amazon-cookies"; // Shared Amazon session cookies (JSON array)
+export const REDIS_KEY_AMAZON_SESSION_VALID = "vine:amazon-session-valid"; // Session validity flag
+export const REDIS_KEY_WORKER_LOCK = (workerType: "manager" | "general" | "product", workerId: number) => `vine:lock:${workerType}-${workerId}`; // Worker process lock to prevent duplicates
 
 export const queueEvents = new QueueEvents(config.QUEUE_NAME, {
   connection: createRedisConnection(),

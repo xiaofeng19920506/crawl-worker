@@ -1,5 +1,5 @@
 import { chromium, Browser, BrowserContext, Page } from "playwright";
-import { config, logger, redisConnection, REDIS_KEY_TOTAL_PAGES, REDIS_KEY_TOTAL_PRODUCTS, REDIS_KEY_PRODUCT_URLS, REDIS_KEY_CRAWL_TRIGGER, REDIS_KEY_LAST_PRODUCT_COUNT, REDIS_KEY_TABS_READY, REDIS_KEY_CURRENT_BATCH_START, REDIS_KEY_CURRENT_BATCH_END, REDIS_KEY_BATCH_COMPLETE, REDIS_KEY_GENERAL_WORKER_COMPLETE, REDIS_KEY_WORKER_PAGES, REDIS_KEY_WORKER_COMPLETE, REDIS_KEY_WORKER_HEARTBEAT, REDIS_KEY_PENDING_PAGES, REDIS_KEY_ASSIGNED_PAGES, REDIS_KEY_GENERAL_WORKER_HEARTBEAT, REDIS_KEY_GENERAL_WORKER_PAGES, productsQueue, ProductJobData } from "shared";
+import { config, logger, redisConnection, REDIS_KEY_TOTAL_PAGES, REDIS_KEY_TOTAL_PRODUCTS, REDIS_KEY_PRODUCT_URLS, REDIS_KEY_CRAWL_TRIGGER, REDIS_KEY_LAST_PRODUCT_COUNT, REDIS_KEY_TABS_READY, REDIS_KEY_CURRENT_BATCH_START, REDIS_KEY_CURRENT_BATCH_END, REDIS_KEY_BATCH_COMPLETE, REDIS_KEY_GENERAL_WORKER_COMPLETE, REDIS_KEY_WORKER_PAGES, REDIS_KEY_WORKER_COMPLETE, REDIS_KEY_WORKER_HEARTBEAT, REDIS_KEY_PENDING_PAGES, REDIS_KEY_ASSIGNED_PAGES, REDIS_KEY_GENERAL_WORKER_HEARTBEAT, REDIS_KEY_GENERAL_WORKER_PAGES, REDIS_KEY_GENERAL_WORKER_PROCESSING, REDIS_KEY_AMAZON_COOKIES, REDIS_KEY_AMAZON_SESSION_VALID, REDIS_KEY_WORKER_LOCK, productsQueue, ProductJobData } from "shared";
 import { setTimeout as delay } from "node:timers/promises";
 
 let browser: Browser | null = null;
@@ -112,6 +112,12 @@ const getBrowser = async (): Promise<Browser> => {
   if (!browser) {
     throw new Error("Failed to get browser from persistent context");
   }
+  
+  // Load shared cookies immediately after creating context (for different servers)
+  await loadSharedCookies(context).catch(() => {
+    logger.debug("No shared cookies available yet, will load on first login");
+  });
+  
   logger.info("Successfully launched new browser");
   return browser;
 };
@@ -136,6 +142,9 @@ const getPage = async (): Promise<Page> => {
   
   // If we have a context (from persistent launch), use it
   if (context) {
+    // Try to load shared cookies if available
+    await loadSharedCookies(context).catch(() => {});
+    
     const pages = context.pages();
     // Filter out DevTools pages
     const regularPages = pages.filter(isRegularPage);
@@ -152,6 +161,10 @@ const getPage = async (): Promise<Page> => {
   if (contexts.length > 0) {
     // Use the first existing context
     const existingContext = contexts[0];
+    
+    // Try to load shared cookies if available
+    await loadSharedCookies(existingContext).catch(() => {});
+    
     const pages = existingContext.pages();
     // Filter out DevTools pages
     const regularPages = pages.filter(isRegularPage);
@@ -168,7 +181,55 @@ const getPage = async (): Promise<Page> => {
   const newContext = await browserInstance.newContext({
     viewport: { width: 1920, height: 1080 },
   });
+  
+  // Try to load shared cookies if available
+  await loadSharedCookies(newContext).catch(() => {});
+  
   return await newContext.newPage();
+};
+
+const loadSharedCookies = async (targetContext: BrowserContext): Promise<boolean> => {
+  try {
+    const cookiesStr = await redisConnection.get(REDIS_KEY_AMAZON_COOKIES);
+    if (!cookiesStr) {
+      logger.debug("No shared cookies found in Redis");
+      return false;
+    }
+    
+    const cookies = JSON.parse(cookiesStr);
+    if (!Array.isArray(cookies) || cookies.length === 0) {
+      logger.debug("Invalid or empty cookies in Redis");
+      return false;
+    }
+    
+    // Check if session is still valid
+    const sessionValid = await redisConnection.get(REDIS_KEY_AMAZON_SESSION_VALID);
+    if (sessionValid !== "1") {
+      logger.debug("Session marked as invalid, not loading cookies");
+      return false;
+    }
+    
+    // Add cookies to context
+    await targetContext.addCookies(cookies);
+    logger.info({ cookieCount: cookies.length }, "✅ Loaded shared cookies from Redis");
+    return true;
+  } catch (error) {
+    logger.warn({ error }, "Failed to load shared cookies, will login normally");
+    return false;
+  }
+};
+
+const saveSharedCookies = async (targetContext: BrowserContext): Promise<void> => {
+  try {
+    const cookies = await targetContext.cookies();
+    if (cookies.length > 0) {
+      await redisConnection.set(REDIS_KEY_AMAZON_COOKIES, JSON.stringify(cookies));
+      await redisConnection.set(REDIS_KEY_AMAZON_SESSION_VALID, "1");
+      logger.info({ cookieCount: cookies.length }, "✅ Saved cookies to Redis for sharing");
+    }
+  } catch (error) {
+    logger.warn({ error }, "Failed to save cookies to Redis");
+  }
 };
 
 const isSignedIn = async (page: Page): Promise<boolean> => {
@@ -202,6 +263,28 @@ const isSignedIn = async (page: Page): Promise<boolean> => {
 };
 
 const ensureLoggedIn = async (page: Page): Promise<void> => {
+  const workerId = config.GENERAL_WORKER_ID || 1;
+  
+  // Try to load shared cookies first (if available)
+  const context = page.context();
+  const cookiesLoaded = await loadSharedCookies(context);
+  
+  if (cookiesLoaded) {
+    // Try navigating with shared cookies
+    logger.info({ workerId }, "Using shared cookies, checking if session is valid...");
+    await navigateToEncoreQueue(page);
+    await delay(3000);
+    
+    const signedIn = await isSignedIn(page);
+    if (signedIn) {
+      logger.info({ workerId }, "✅ Logged in successfully using shared cookies");
+      return; // Success with shared cookies
+    } else {
+      logger.warn({ workerId }, "Shared cookies invalid, will login normally");
+      await redisConnection.set(REDIS_KEY_AMAZON_SESSION_VALID, "0"); // Mark session as invalid
+    }
+  }
+  
   // Navigate directly to encore queue to check login status
   await navigateToEncoreQueue(page);
 
@@ -209,11 +292,14 @@ const ensureLoggedIn = async (page: Page): Promise<void> => {
 
   const signedIn = await isSignedIn(page);
   if (!signedIn) {
-    logger.error({ currentUrl: page.url() }, "Not logged in. Please log in via VNC.");
-    throw new Error("Not logged in. Please log in via VNC at http://localhost:6080");
+    logger.error({ currentUrl: page.url(), workerId }, "Not logged in. Please log in manually or wait for another worker to login.");
+    throw new Error("Not logged in. Please log in manually or wait for session to be shared.");
   }
 
-  logger.info("✅ Logged in successfully");
+  logger.info({ workerId }, "✅ Logged in successfully");
+  
+  // Save cookies to Redis for other workers to use
+  await saveSharedCookies(context);
 };
 
 const discoverPageInfo = async (page: Page): Promise<{ totalPages: number; totalProducts: number }> => {
@@ -606,35 +692,97 @@ const openBatchOfTabs = async (targetContext: BrowserContext, batchStart: number
 };
 
 const closeBatchTabs = async (targetContext: BrowserContext, batchStart: number, batchEnd: number): Promise<void> => {
-  logger.info({ batchStart, batchEnd }, "Closing tabs for completed batch");
+  const workerId = config.GENERAL_WORKER_ID || 1;
+  logger.info({ workerId, batchStart, batchEnd }, "Closing tabs for completed batch");
   
   try {
     const pages = targetContext.pages();
     let closedCount = 0;
+    let skippedCount = 0;
+    const pagesToClose: Page[] = [];
     
+    // First, collect all pages that match the batch range
     for (const page of pages) {
       try {
+        if (page.isClosed()) {
+          skippedCount++;
+          continue;
+        }
+        
         const url = page.url();
         // Check if this page URL matches the batch range
         const pageMatch = url.match(/[?&]page=(\d+)/);
         if (pageMatch) {
           const pageNum = parseInt(pageMatch[1], 10);
           if (pageNum >= batchStart && pageNum <= batchEnd) {
-            if (!page.isClosed()) {
-              await page.close();
-              closedCount++;
-            }
+            pagesToClose.push(page);
           }
         }
       } catch (error: any) {
-        // Page might already be closed or inaccessible
-        logger.debug({ error: error.message }, "Error closing tab (may already be closed)");
+        // Page might be closed or inaccessible - skip it
+        skippedCount++;
+        logger.debug({ error: error.message }, "Skipping page (may be closed or inaccessible)");
       }
     }
     
-    logger.info({ batchStart, batchEnd, closedCount }, "✅ Closed tabs for batch");
+    // Close all matching pages in parallel for efficiency
+    const closePromises = pagesToClose.map(async (page) => {
+      try {
+        if (!page.isClosed()) {
+          await page.close();
+          return true;
+        }
+        return false;
+      } catch (error: any) {
+        logger.debug({ error: error.message }, "Error closing individual tab");
+        return false;
+      }
+    });
+    
+    const results = await Promise.all(closePromises);
+    closedCount = results.filter(r => r === true).length;
+    
+    logger.info({ 
+      workerId, 
+      batchStart, 
+      batchEnd, 
+      closedCount, 
+      skippedCount,
+      totalPagesInContext: pages.length 
+    }, "✅ Closed tabs for batch");
+    
+    // Verify tabs are actually closed (double-check)
+    await delay(500); // Small delay to let closing complete
+    const remainingPages = targetContext.pages().filter(p => {
+      try {
+        if (p.isClosed()) return false;
+        const url = p.url();
+        const pageMatch = url.match(/[?&]page=(\d+)/);
+        if (pageMatch) {
+          const pageNum = parseInt(pageMatch[1], 10);
+          return pageNum >= batchStart && pageNum <= batchEnd;
+        }
+        return false;
+      } catch {
+        return false;
+      }
+    });
+    
+    if (remainingPages.length > 0) {
+      logger.warn({ workerId, batchStart, batchEnd, remainingCount: remainingPages.length }, "Some tabs from this batch are still open - retrying close");
+      // Retry closing remaining tabs
+      for (const page of remainingPages) {
+        try {
+          if (!page.isClosed()) {
+            await page.close();
+          }
+        } catch {
+          // Ignore errors on retry
+        }
+      }
+    }
   } catch (error) {
-    logger.error({ error, batchStart, batchEnd }, "Error closing batch tabs");
+    logger.error({ error, workerId, batchStart, batchEnd }, "Error closing batch tabs");
     // Don't throw - continue to next batch even if closing fails
   }
 };
@@ -857,12 +1005,15 @@ const openAllPageTabsInBatches = async (page: Page, assignedStartPage: number, a
       // Wait for product workers to complete this batch before opening next
       await waitForBatchCompletion();
       
-      logger.info({ workerId, batchStart, batchEnd }, "Batch processing complete");
+      logger.info({ workerId, batchStart, batchEnd }, "✅ Batch processing complete - all products crawled");
       
-      // Close tabs for this completed batch
+      // Close tabs for this completed batch BEFORE opening next batch
       await closeBatchTabs(targetContext, batchStart, batchEnd);
       
       logger.info({ workerId, batchStart, batchEnd }, "✅ Batch tabs closed, ready for next batch");
+      
+      // Small delay to ensure tabs are fully closed before opening next batch
+      await delay(1000);
     }
     
     logger.info({ workerId, totalTabs: totalTabsOpened, totalPages: assignedEndPage - assignedStartPage + 1 }, "✅ All batches processed - all assigned page tabs opened and crawled");
@@ -913,8 +1064,19 @@ const crawlAndCheck = async (page: Page): Promise<void> => {
   }
 };
 
+// Track current processing state to prevent duplicates
+let isProcessing = false;
+let lastProcessedRange: { start: number; end: number } | null = null;
+
 const discoverAndProcessAssignedPages = async (page: Page): Promise<void> => {
   const workerId = config.GENERAL_WORKER_ID || 1;
+  
+  // Prevent duplicate processing
+  if (isProcessing) {
+    logger.debug({ workerId }, "Already processing, skipping this check");
+    return;
+  }
+  
   try {
     // Discover total pages and products from the encore page
     logger.info({ workerId }, "Starting page and product info discovery from encore page...");
@@ -935,20 +1097,49 @@ const discoverAndProcessAssignedPages = async (page: Page): Promise<void> => {
     }
     
     const assignedRange = JSON.parse(assignedPagesStr) as { start: number; end: number };
-    logger.info({ workerId, assignedRange, totalPages }, "Got assigned page range from manager");
     
-    // Check if we've already completed this assignment
-    const completeStr = await redisConnection.get(REDIS_KEY_GENERAL_WORKER_COMPLETE(workerId));
-    if (completeStr === "1") {
-      logger.info({ workerId, assignedRange }, "Already completed assigned range. Waiting for new assignment...");
-      return;
+    // Check if this is the same range we're already processing or completed
+    if (lastProcessedRange && 
+        lastProcessedRange.start === assignedRange.start && 
+        lastProcessedRange.end === assignedRange.end) {
+      // Check if we've already completed this assignment
+      const completeStr = await redisConnection.get(REDIS_KEY_GENERAL_WORKER_COMPLETE(workerId));
+      if (completeStr === "1") {
+        logger.debug({ workerId, assignedRange }, "Already completed this range. Waiting for new assignment...");
+        return;
+      }
+      
+      // Check if we're currently processing this range
+      const processingStr = await redisConnection.get(REDIS_KEY_GENERAL_WORKER_PROCESSING(workerId));
+      if (processingStr === "1") {
+        logger.debug({ workerId, assignedRange }, "Already processing this range. Skipping duplicate...");
+        return;
+      }
     }
     
-    // Process assigned page range
-    await openAllPageTabsInBatches(page, assignedRange.start, assignedRange.end);
+    logger.info({ workerId, assignedRange, totalPages }, "Got assigned page range from manager");
     
-    logger.info({ workerId, assignedRange }, "✅ Completed processing assigned page range");
+    // Set processing lock
+    isProcessing = true;
+    lastProcessedRange = assignedRange;
+    await redisConnection.set(REDIS_KEY_GENERAL_WORKER_PROCESSING(workerId), "1");
+    await redisConnection.del(REDIS_KEY_GENERAL_WORKER_COMPLETE(workerId)); // Clear completion flag
+    
+    try {
+      // Process assigned page range
+      await openAllPageTabsInBatches(page, assignedRange.start, assignedRange.end);
+      
+      logger.info({ workerId, assignedRange }, "✅ Completed processing assigned page range");
+    } finally {
+      // Clear processing lock
+      isProcessing = false;
+      await redisConnection.del(REDIS_KEY_GENERAL_WORKER_PROCESSING(workerId));
+    }
   } catch (discoveryError) {
+    // Clear processing lock on error
+    isProcessing = false;
+    await redisConnection.del(REDIS_KEY_GENERAL_WORKER_PROCESSING(workerId)).catch(() => {});
+    
     const errorMessage = discoveryError instanceof Error ? discoveryError.message : String(discoveryError);
     const errorStack = discoveryError instanceof Error ? discoveryError.stack : undefined;
     logger.error({ error: errorMessage, stack: errorStack, workerId: config.GENERAL_WORKER_ID || 1 }, "Failed during discovery/processing phase");
@@ -956,9 +1147,41 @@ const discoverAndProcessAssignedPages = async (page: Page): Promise<void> => {
   }
 };
 
+const checkForDuplicateWorker = async (workerId: number): Promise<boolean> => {
+  try {
+    const lockKey = REDIS_KEY_WORKER_LOCK("general", workerId);
+    const existingLock = await redisConnection.get(lockKey);
+    
+    if (existingLock) {
+      const lockTime = parseInt(existingLock, 10);
+      const now = Date.now();
+      // If lock is older than 30 seconds, assume previous worker crashed
+      if (now - lockTime < 30000) {
+        logger.error({ workerId, existingLockTime: new Date(lockTime).toISOString() }, "❌ Another General Worker with the same ID is already running!");
+        logger.error({ workerId }, "Please stop the duplicate worker or use a different GENERAL_WORKER_ID");
+        return true; // Duplicate found
+      }
+    }
+    
+    // Set lock with current timestamp
+    await redisConnection.set(lockKey, Date.now().toString());
+    return false; // No duplicate
+  } catch (error) {
+    logger.warn({ error, workerId }, "Failed to check for duplicate worker, continuing anyway");
+    return false;
+  }
+};
+
 const main = async (): Promise<void> => {
   const workerId = config.GENERAL_WORKER_ID || 1;
-  logger.info({ workerId }, "General worker starting...");
+  
+  // Check for duplicate worker before starting
+  const hasDuplicate = await checkForDuplicateWorker(workerId);
+  if (hasDuplicate) {
+    process.exit(1);
+  }
+  
+  logger.info({ workerId }, `🚀 General Worker #${workerId} starting...`);
   logger.info({ workerId }, "Standalone worker - will discover pages, send heartbeats to manager, and process assigned page ranges");
   
   // Start heartbeat loop - send heartbeat every 10 seconds
@@ -1023,9 +1246,10 @@ const main = async (): Promise<void> => {
     const shutdown = async (): Promise<void> => {
       logger.info({ workerId }, "General worker shutting down");
       // Clear heartbeat on shutdown
-      await redisConnection.del(REDIS_KEY_GENERAL_WORKER_HEARTBEAT(workerId));
+      await redisConnection.del(REDIS_KEY_GENERAL_WORKER_HEARTBEAT(workerId)).catch(() => {});
+      await redisConnection.del(REDIS_KEY_WORKER_LOCK("general", workerId)).catch(() => {}); // Release lock
       if (browser) {
-        await browser.close();
+        await browser.close().catch(() => {});
       }
       process.exit(0);
     };
