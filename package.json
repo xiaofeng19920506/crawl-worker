@@ -10,6 +10,8 @@
     "start:product-worker": "tsx product-worker/src/index.ts",
     "start:api": "tsx api/src/index.ts",
     "start:manager-api": "concurrently -n manager,api -c blue,green \"npm run start:manager-worker\" \"npm run start:api\"",
+    "test:flow": "powershell -ExecutionPolicy Bypass -File test-flow.ps1",
+    "test:flow:all": "concurrently -n manager,general,product -c blue,green,magenta \"TABS_PER_BATCH=100 npm run start:manager-worker\" \"GENERAL_WORKER_ID=1 TABS_PER_BATCH=100 npm run start:general-worker\" \"PRODUCT_WORKER_ID=1 npm run start:product-worker\"",
     "dev:manager-worker": "tsx watch manager-worker/src/index.ts",
     "dev:general-worker": "tsx watch general-worker/src/index.ts",
     "dev:product-worker": "tsx watch product-worker/src/index.ts",
