@@ -1174,7 +1174,6 @@ const main = async (): Promise<void> => {
   } catch (error) {
     logger.warn({ error, workerId }, "Failed to clear old page assignments on startup");
   }
-  const workerId = config.PRODUCT_WORKER_ID || 1;
   
   // Check for duplicate worker before starting
   const duplicateCheck = await checkForDuplicateWorker(workerId);
