@@ -912,6 +912,12 @@ const closeBatchTabs = async (targetContext: BrowserContext, batchStart: number,
   logger.info({ workerId, batchStart, batchEnd }, "Closing tabs for completed batch");
   
   try {
+    // Check if context is closed before trying to access pages
+    if (targetContext.isClosed()) {
+      logger.warn({ workerId, batchStart, batchEnd }, "Context is already closed, cannot close tabs");
+      return;
+    }
+    
     const pages = targetContext.pages();
     let closedCount = 0;
     let skippedCount = 0;
@@ -937,20 +943,42 @@ const closeBatchTabs = async (targetContext: BrowserContext, batchStart: number,
       } catch (error: any) {
         // Page might be closed or inaccessible - skip it
         skippedCount++;
-        logger.debug({ error: error.message }, "Skipping page (may be closed or inaccessible)");
+        logger.debug({ error: error?.message || String(error) }, "Skipping page (may be closed or inaccessible)");
       }
+    }
+    
+    if (pagesToClose.length === 0) {
+      logger.info({ workerId, batchStart, batchEnd, totalPages: pages.length }, "No tabs found to close for this batch (may already be closed)");
+      return;
     }
     
     // Close all matching pages in parallel for efficiency
     const closePromises = pagesToClose.map(async (page) => {
       try {
-        if (!page.isClosed()) {
-          await page.close();
-          return true;
+        // Double-check page is still open and accessible
+        if (page.isClosed()) {
+          return false;
+        }
+        
+        // Verify the page URL still matches before closing
+        try {
+          const url = page.url();
+          const pageMatch = url.match(/[?&]page=(\d+)/);
+          if (pageMatch) {
+            const pageNum = parseInt(pageMatch[1], 10);
+            if (pageNum >= batchStart && pageNum <= batchEnd) {
+              await page.close();
+              return true;
+            }
+          }
+        } catch {
+          // Page might have been closed or navigated away, skip it
+          return false;
         }
         return false;
       } catch (error: any) {
-        logger.debug({ error: error.message }, "Error closing individual tab");
+        const errorMsg = error?.message || String(error);
+        logger.debug({ error: errorMsg }, "Error closing individual tab");
         return false;
       }
     });
@@ -997,10 +1025,20 @@ const closeBatchTabs = async (targetContext: BrowserContext, batchStart: number,
         }
       }
       }
-    } catch (error) {
-    logger.error({ error, workerId, batchStart, batchEnd }, "Error closing batch tabs");
-    // Don't throw - continue to next batch even if closing fails
-  }
+    } catch (error: any) {
+      // Better error logging
+      const errorMessage = error instanceof Error ? error.message : String(error);
+      const errorStack = error instanceof Error ? error.stack : undefined;
+      logger.error({ 
+        error: errorMessage, 
+        errorStack,
+        workerId, 
+        batchStart, 
+        batchEnd,
+        contextClosed: targetContext.isClosed() 
+      }, "Error closing batch tabs");
+      // Don't throw - continue to next batch even if closing fails
+    }
 };
 
 const detectActiveWorkers = async (): Promise<number[]> => {
@@ -1248,6 +1286,7 @@ const openAllPageTabsInBatches = async (page: Page, assignedStartPage: number, a
             continue;
           }
           
+          // Close tabs for this batch
           await closeBatchTabs(batch.context, batch.batchStart, batch.batchEnd);
           closedTabCount += (batch.batchEnd - batch.batchStart + 1);
           logger.info({ workerId, batchStart: batch.batchStart, batchEnd: batch.batchEnd }, "✅ Closed completed batch tabs");
@@ -1256,9 +1295,18 @@ const openAllPageTabsInBatches = async (page: Page, assignedStartPage: number, a
           const index = batchContexts.findIndex(b => b.batchStart === batch.batchStart && b.batchEnd === batch.batchEnd);
           if (index !== -1) {
             batchContexts.splice(index, 1);
-      }
-    } catch (error) {
-          logger.warn({ error, batchStart: batch.batchStart }, "Failed to close completed batch");
+          }
+        } catch (error: any) {
+          // Better error logging
+          const errorMessage = error instanceof Error ? error.message : String(error);
+          const errorStack = error instanceof Error ? error.stack : undefined;
+          logger.warn({ 
+            error: errorMessage, 
+            errorStack,
+            batchStart: batch.batchStart, 
+            batchEnd: batch.batchEnd,
+            contextClosed: batch.context.isClosed() 
+          }, "Failed to close completed batch");
         }
       }
       
