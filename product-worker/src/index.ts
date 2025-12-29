@@ -124,18 +124,21 @@ const getBrowser = async (): Promise<Browser> => {
     viewport: { width: 1920, height: 1080 },
   };
   
-  // Add proxy configuration if enabled
+  // Add IPRoyal proxy configuration if enabled
+  // If USE_PROXY=false or PROXY_SERVER not configured, use current network IP (no proxy)
   if (config.USE_PROXY && config.PROXY_SERVER) {
     launchOptions.proxy = {
-      server: config.PROXY_SERVER,
+      server: config.PROXY_SERVER, // IPRoyal proxy server
     };
     
     if (config.PROXY_USERNAME && config.PROXY_PASSWORD) {
-      launchOptions.proxy.username = config.PROXY_USERNAME;
-      launchOptions.proxy.password = config.PROXY_PASSWORD;
+      launchOptions.proxy.username = config.PROXY_USERNAME; // IPRoyal username
+      launchOptions.proxy.password = config.PROXY_PASSWORD; // IPRoyal password
     }
     
-    logger.info({ proxy: config.PROXY_SERVER }, "Using proxy for browser");
+    logger.info({ proxy: config.PROXY_SERVER }, "Using IPRoyal proxy for browser");
+  } else {
+    logger.info("Using current network IP (no proxy)");
   }
   
   // Only add executablePath if provided (for local Chrome)

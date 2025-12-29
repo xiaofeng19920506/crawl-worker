@@ -40,7 +40,7 @@ const getBrowser = async (): Promise<Browser> => {
       
       if (browser && browser.isConnected()) {
         logger.info("Successfully connected to existing Chrome browser");
-        return browser;
+    return browser;
       } else {
         throw new Error("Browser connected but isConnected() returned false");
       }
@@ -84,31 +84,34 @@ const getBrowser = async (): Promise<Browser> => {
   
   logger.info({ 
     userDataDir, 
-    headless: config.PLAYWRIGHT_HEADLESS,
+      headless: config.PLAYWRIGHT_HEADLESS,
     chromePath: chromePath || "default (Playwright bundled)",
   }, "Launching new browser with persistent context");
   
   const launchOptions: any = {
     headless: config.PLAYWRIGHT_HEADLESS,
-    args: [
-      "--disable-blink-features=AutomationControlled",
-      "--window-size=1920,1080",
-    ],
-    viewport: { width: 1920, height: 1080 },
+      args: [
+        "--disable-blink-features=AutomationControlled",
+        "--window-size=1920,1080",
+      ],
+      viewport: { width: 1920, height: 1080 },
   };
   
-  // Add proxy configuration if enabled
+  // Add IPRoyal proxy configuration if enabled
+  // If USE_PROXY=false or PROXY_SERVER not configured, use current network IP (no proxy)
   if (config.USE_PROXY && config.PROXY_SERVER) {
     launchOptions.proxy = {
-      server: config.PROXY_SERVER,
+      server: config.PROXY_SERVER, // IPRoyal proxy server
     };
     
     if (config.PROXY_USERNAME && config.PROXY_PASSWORD) {
-      launchOptions.proxy.username = config.PROXY_USERNAME;
-      launchOptions.proxy.password = config.PROXY_PASSWORD;
+      launchOptions.proxy.username = config.PROXY_USERNAME; // IPRoyal username
+      launchOptions.proxy.password = config.PROXY_PASSWORD; // IPRoyal password
     }
     
-    logger.info({ proxy: config.PROXY_SERVER }, "Using proxy for browser");
+    logger.info({ proxy: config.PROXY_SERVER }, "Using IPRoyal proxy for browser");
+  } else {
+    logger.info("Using current network IP (no proxy)");
   }
   
   // Only add executablePath if provided (for local Chrome)
@@ -122,9 +125,9 @@ const getBrowser = async (): Promise<Browser> => {
   }
   
   context = await chromium.launchPersistentContext(userDataDir, launchOptions);
-  browser = context.browser();
-  if (!browser) {
-    throw new Error("Failed to get browser from persistent context");
+    browser = context.browser();
+    if (!browser) {
+      throw new Error("Failed to get browser from persistent context");
   }
   
   // Load shared cookies immediately after creating context (for different servers)
@@ -200,6 +203,67 @@ const getPage = async (): Promise<Page> => {
   await loadSharedCookies(newContext).catch(() => {});
   
   return await newContext.newPage();
+};
+
+const createNewContextWithProxy = async (batchNumber: number): Promise<BrowserContext> => {
+  const workerId = config.GENERAL_WORKER_ID || 1;
+  const chromePath = config.PLAYWRIGHT_CHROME_EXECUTABLE_PATH;
+  
+  // Create a new user data dir for this batch (to enable proxy switching)
+  // Use batch number to create unique directory per batch
+  const baseUserDataDir = config.PLAYWRIGHT_USER_DATA_DIR || "./browser-data";
+  const batchUserDataDir = `${baseUserDataDir}-batch-${batchNumber}`;
+  
+  logger.info({ workerId, batchNumber, userDataDir: batchUserDataDir }, "Creating new browser context with proxy");
+  
+  const launchOptions: any = {
+    headless: config.PLAYWRIGHT_HEADLESS,
+    args: [
+      "--disable-blink-features=AutomationControlled",
+      "--window-size=1920,1080",
+    ],
+    viewport: { width: 1920, height: 1080 },
+  };
+  
+  // Add IPRoyal proxy configuration if enabled
+  // If USE_PROXY=false or PROXY_SERVER not configured, use current network IP (no proxy)
+  // Note: IPRoyal typically rotates IPs automatically, but creating a new context
+  // ensures a fresh proxy connection for each batch
+  if (config.USE_PROXY && config.PROXY_SERVER) {
+    launchOptions.proxy = {
+      server: config.PROXY_SERVER, // IPRoyal proxy server
+    };
+    
+    if (config.PROXY_USERNAME && config.PROXY_PASSWORD) {
+      launchOptions.proxy.username = config.PROXY_USERNAME; // IPRoyal username
+      launchOptions.proxy.password = config.PROXY_PASSWORD; // IPRoyal password
+    }
+    
+    logger.info({ workerId, batchNumber, proxy: config.PROXY_SERVER }, "Using IPRoyal proxy for new context");
+  } else {
+    logger.info({ workerId, batchNumber }, "Using current network IP (no proxy)");
+  }
+  
+  // Only add executablePath if provided
+  if (chromePath) {
+    launchOptions.executablePath = chromePath;
+  }
+  
+  // Only add sandbox args on Linux
+  if (process.platform === "linux") {
+    launchOptions.args.push("--no-sandbox", "--disable-setuid-sandbox", "--disable-dev-shm-usage");
+  }
+  
+  const newContext = await chromium.launchPersistentContext(batchUserDataDir, launchOptions);
+  
+  // Load shared cookies immediately after creating context
+  // Cookies are shared via Redis, so new contexts can use existing session
+  await loadSharedCookies(newContext).catch(() => {
+    logger.debug("No shared cookies available yet, will load on first login");
+  });
+  
+  logger.info({ workerId, batchNumber }, "✅ Created new browser context with proxy");
+  return newContext;
 };
 
 const loadSharedCookies = async (targetContext: BrowserContext): Promise<boolean> => {
@@ -306,12 +370,42 @@ const ensureLoggedIn = async (page: Page): Promise<void> => {
 
   const signedIn = await isSignedIn(page);
   if (!signedIn) {
-    logger.error({ currentUrl: page.url(), workerId }, "Not logged in. Please log in manually or wait for another worker to login.");
-    throw new Error("Not logged in. Please log in manually or wait for session to be shared.");
+    logger.warn({ currentUrl: page.url(), workerId }, "Not logged in. Waiting for manual login...");
+    logger.info({ workerId }, "Please log in manually in the browser window. The worker will wait and check periodically.");
+    
+    // Wait for user to manually log in - check every 5 seconds
+    const MAX_WAIT_TIME = 300000; // 5 minutes max wait
+    const CHECK_INTERVAL = 5000; // Check every 5 seconds
+    const startTime = Date.now();
+    
+    while (Date.now() - startTime < MAX_WAIT_TIME) {
+      await delay(CHECK_INTERVAL);
+      
+      // Check if page is still open
+      if (page.isClosed()) {
+        logger.error({ workerId }, "Page was closed while waiting for login");
+        throw new Error("Page was closed while waiting for manual login");
+      }
+      
+      // Re-check login status
+      const stillSignedIn = await isSignedIn(page);
+      if (stillSignedIn) {
+        logger.info({ workerId }, "✅ Manual login detected! Logged in successfully");
+        // Save cookies to Redis for other workers to use
+        await saveSharedCookies(context);
+        return; // Success - exit function
+      }
+      
+      logger.debug({ workerId, elapsed: Date.now() - startTime }, "Still waiting for manual login...");
+    }
+    
+    // If we reach here, user didn't log in within the timeout
+    logger.error({ workerId, waitTime: MAX_WAIT_TIME }, "Timeout waiting for manual login");
+    throw new Error("Timeout waiting for manual login. Please ensure you log in within 5 minutes.");
   }
 
   logger.info({ workerId }, "✅ Logged in successfully");
-  
+
   // Save cookies to Redis for other workers to use
   await saveSharedCookies(context);
 };
@@ -323,7 +417,7 @@ const discoverPageInfo = async (page: Page): Promise<{ totalPages: number; total
   const currentUrl = page.url();
   if (!currentUrl.includes("queue=encore")) {
     logger.info("Navigating to encore queue...");
-    await navigateToEncoreQueue(page);
+  await navigateToEncoreQueue(page);
   }
   
   // Wait for page to fully load
@@ -339,14 +433,14 @@ const discoverPageInfo = async (page: Page): Promise<{ totalPages: number; total
     };
 
     // Method 1: Find pagination component and extract last page number
-    const paginationSelectors = [
-      'span[data-component-type="s-pagination"]',
-      '.s-pagination',
-      '[aria-label*="pagination"]',
+  const paginationSelectors = [
+    'span[data-component-type="s-pagination"]',
+    '.s-pagination',
+    '[aria-label*="pagination"]',
       '.a-pagination',
-    ];
+  ];
 
-    for (const selector of paginationSelectors) {
+  for (const selector of paginationSelectors) {
       const pagination = document.querySelector(selector);
       if (pagination) {
         // Find all page number links/buttons
@@ -436,9 +530,9 @@ const discoverPageInfo = async (page: Page): Promise<{ totalPages: number; total
       }
       
       if (result.totalProducts > 0) {
-        break;
+          break;
+        }
       }
-    }
 
     // Method 3: Count products on the current page and estimate
     // This is a fallback if we can't find the total count
@@ -487,8 +581,8 @@ const discoverPageInfo = async (page: Page): Promise<{ totalPages: number; total
             if (pageNum > pageInfo.totalPages) {
               pageInfo.totalPages = pageNum;
               logger.info({ totalPages: pageInfo.totalPages }, "Found total pages from last page link");
-              break;
-            }
+          break;
+        }
           }
         }
       } catch (error) {
@@ -620,9 +714,9 @@ const navigateToEncoreQueue = async (page: Page, retryCount = 0): Promise<void> 
 
   try {
     const response = await page.goto(config.AMAZON_VINE_ENCORE_URL, {
-      waitUntil: "load",
-      timeout: 60000,
-    });
+    waitUntil: "load",
+    timeout: 60000,
+  });
     
     // Check for 503 status - only on https://www.amazon.com/vine endpoint
     const responseUrl = response?.url() || "";
@@ -635,7 +729,7 @@ const navigateToEncoreQueue = async (page: Page, retryCount = 0): Promise<void> 
       return navigateToEncoreQueue(page, retryCount + 1);
     }
     
-    await delay(2000);
+  await delay(2000);
     
     // Check page content for 503 error (only on https://www.amazon.com/vine endpoint)
     const has503 = await checkFor503Error(page);
@@ -645,9 +739,9 @@ const navigateToEncoreQueue = async (page: Page, retryCount = 0): Promise<void> 
       return navigateToEncoreQueue(page, retryCount + 1);
     }
 
-    const newUrl = page.url();
-    if (newUrl.includes("/ap/signin") || newUrl.includes("/signin")) {
-      throw new Error("Session expired after navigation");
+  const newUrl = page.url();
+  if (newUrl.includes("/ap/signin") || newUrl.includes("/signin")) {
+    throw new Error("Session expired after navigation");
     }
   } catch (error: any) {
     // Check if error is related to 503 - only retry if we're navigating to the vine endpoint
@@ -673,7 +767,7 @@ const openBatchOfTabs = async (targetContext: BrowserContext, batchStart: number
   const startTime = Date.now();
   const batchSize = batchEnd - batchStart + 1;
   
-  // Get delay range from config (Zod schema provides defaults, so no fallback needed)
+  // Get delay range from config (1-3 seconds as requested)
   const minDelay = config.TAB_OPEN_DELAY_MIN_MS;
   const maxDelay = config.TAB_OPEN_DELAY_MAX_MS;
   
@@ -683,9 +777,10 @@ const openBatchOfTabs = async (targetContext: BrowserContext, batchStart: number
   
   for (let pageNum = batchStart; pageNum <= batchEnd; pageNum++) {
     try {
-      // Add random delay before opening each tab (except the first one)
+      // Add random delay before opening each tab (1-3 seconds as requested)
       if (pageNum > batchStart) {
         const randomDelay = Math.floor(Math.random() * (delayMax - delayMin + 1)) + delayMin;
+        logger.debug({ pageNum, delay: randomDelay }, `Waiting ${randomDelay}ms before opening next tab`);
         await delay(randomDelay);
       }
       
@@ -699,6 +794,8 @@ const openBatchOfTabs = async (targetContext: BrowserContext, batchStart: number
       }).catch(() => {
         // Navigation continues in background - non-blocking
       });
+      
+      logger.debug({ pageNum, encoreUrl }, `Opened tab for page ${pageNum}`);
     } catch (error: any) {
       // Log error but continue
       logger.warn({ error: error.message, pageNum }, "Failed to open tab");
@@ -977,27 +1074,39 @@ const openAllPageTabsInBatches = async (page: Page, assignedStartPage: number, a
   try {
     logger.info({ workerId, assignedStartPage, assignedEndPage, totalPages: assignedEndPage - assignedStartPage + 1 }, "Starting to open assigned page tabs in batches");
     
-    // Get browser context
-    const browserInstance = await getBrowser();
-    let targetContext: BrowserContext;
-    
-    if (context) {
-      targetContext = context;
-    } else {
-      const contexts = browserInstance.contexts();
-      if (contexts.length > 0) {
-        targetContext = contexts[0];
-      } else {
-        throw new Error("No browser context available");
-      }
-    }
-    
-    const TABS_PER_BATCH = config.TABS_PER_BATCH || 50;
+    const TABS_PER_BATCH = config.TABS_PER_BATCH || 20;
     let totalTabsOpened = 0;
+    let previousBatchContext: BrowserContext | null = null;
+    const batchContexts: Array<{ batchStart: number; batchEnd: number; context: BrowserContext }> = [];
     
     // Process assigned pages in batches
     for (let batchStart = assignedStartPage; batchStart <= assignedEndPage; batchStart += TABS_PER_BATCH) {
       const batchEnd = Math.min(batchStart + TABS_PER_BATCH - 1, assignedEndPage);
+      const batchNumber = Math.ceil((batchStart - assignedStartPage) / TABS_PER_BATCH) + 1;
+      
+      logger.info({ workerId, batchStart, batchEnd, assignedStartPage, assignedEndPage, batchNumber, tabsPerBatch: TABS_PER_BATCH }, "Starting new batch");
+      
+      // Create new context with proxy for this batch (switches proxy for each batch)
+      let targetContext: BrowserContext;
+      if (config.USE_PROXY && config.PROXY_SERVER) {
+        // Create new context with proxy for this batch
+        targetContext = await createNewContextWithProxy(batchNumber);
+        batchContexts.push({ batchStart, batchEnd, context: targetContext });
+        logger.info({ workerId, batchStart, batchEnd, batchNumber }, "✅ Created new context with proxy for this batch");
+      } else {
+        // Use existing context if proxy is not enabled
+        const browserInstance = await getBrowser();
+        if (context) {
+          targetContext = context;
+        } else {
+          const contexts = browserInstance.contexts();
+          if (contexts.length > 0) {
+            targetContext = contexts[0];
+          } else {
+            throw new Error("No browser context available");
+          }
+        }
+      }
       
       // Set current batch info in Redis
       await redisConnection.set(REDIS_KEY_CURRENT_BATCH_START, batchStart.toString());
@@ -1005,9 +1114,7 @@ const openAllPageTabsInBatches = async (page: Page, assignedStartPage: number, a
       await redisConnection.del(REDIS_KEY_BATCH_COMPLETE); // Clear completion flag
       await redisConnection.del(REDIS_KEY_TABS_READY); // Clear ready flag
       
-      logger.info({ workerId, batchStart, batchEnd, assignedStartPage, assignedEndPage, batchNumber: Math.ceil((batchStart - assignedStartPage) / TABS_PER_BATCH) + 1, tabsPerBatch: TABS_PER_BATCH }, "Starting new batch");
-      
-      // Open this batch of tabs
+      // Open this batch of tabs (with 1-3 second random delay between each tab)
       const tabsOpened = await openBatchOfTabs(targetContext, batchStart, batchEnd, assignedEndPage, totalTabsOpened);
       totalTabsOpened += tabsOpened;
       
@@ -1017,23 +1124,63 @@ const openAllPageTabsInBatches = async (page: Page, assignedStartPage: number, a
       const pages = Array.from({ length: batchEnd - batchStart + 1 }, (_, i) => batchStart + i);
       await distributePagesToWorkers(pages);
       
-      // Mark tabs as ready and trigger product workers
+      // Mark tabs as ready and trigger product workers to crawl this batch
+      // Note: Workers will crawl this batch while we continue to open the next batch
       await redisConnection.set(REDIS_KEY_TABS_READY, "1");
       await redisConnection.set(REDIS_KEY_CRAWL_TRIGGER, "1");
-      logger.info({ workerId, batchStart, batchEnd }, "✅ Tabs ready - assigned pages and triggered product workers to crawl this batch");
+      logger.info({ workerId, batchStart, batchEnd }, "✅ Tabs ready - assigned pages and triggered product workers to crawl this batch (workers will crawl in parallel)");
       
-      // Wait for product workers to complete this batch before opening next
-      await waitForBatchCompletion();
+      // Close previous batch's context if it exists and proxy is enabled
+      // This allows workers to continue crawling the previous batch while we open the next batch
+      if (previousBatchContext && config.USE_PROXY && config.PROXY_SERVER) {
+        // Don't close immediately - let workers finish crawling
+        // We'll close it after a delay to ensure workers have started
+        setTimeout(async () => {
+          try {
+            // Close tabs for the previous batch
+            const prevBatch = batchContexts.find(b => b.context === previousBatchContext);
+            if (prevBatch) {
+              await closeBatchTabs(previousBatchContext, prevBatch.batchStart, prevBatch.batchEnd);
+              logger.info({ workerId, batchStart: prevBatch.batchStart, batchEnd: prevBatch.batchEnd }, "✅ Closed previous batch tabs");
+              
+              // Close the context after a delay to ensure workers finished
+              setTimeout(async () => {
+                try {
+                  await previousBatchContext.close();
+                  logger.info({ workerId }, "✅ Closed previous batch context");
+    } catch (error) {
+                  logger.warn({ error }, "Failed to close previous batch context");
+                }
+              }, 5000); // Wait 5 seconds before closing context
+            }
+          } catch (error) {
+            logger.warn({ error }, "Failed to close previous batch");
+          }
+        }, 2000); // Wait 2 seconds before starting to close previous batch
+      }
       
-      logger.info({ workerId, batchStart, batchEnd }, "✅ Batch processing complete - all products crawled");
+      // Update previous batch context for next iteration
+      previousBatchContext = targetContext;
       
-      // Close tabs for this completed batch BEFORE opening next batch
-      await closeBatchTabs(targetContext, batchStart, batchEnd);
-      
-      logger.info({ workerId, batchStart, batchEnd }, "✅ Batch tabs closed, ready for next batch");
-      
-      // Small delay to ensure tabs are fully closed before opening next batch
-      await delay(1000);
+      // Small delay before opening next batch (allows workers to start processing)
+      if (batchStart + TABS_PER_BATCH <= assignedEndPage) {
+        await delay(1000);
+      }
+    }
+    
+    // Wait for the last batch to complete
+    logger.info({ workerId }, "Waiting for final batch to complete...");
+    await waitForBatchCompletion();
+    
+    // Close the last batch's context if using proxy
+    if (previousBatchContext && config.USE_PROXY && config.PROXY_SERVER) {
+      const lastBatch = batchContexts[batchContexts.length - 1];
+      if (lastBatch) {
+        await closeBatchTabs(previousBatchContext, lastBatch.batchStart, lastBatch.batchEnd);
+        await delay(2000);
+        await previousBatchContext.close();
+        logger.info({ workerId }, "✅ Closed final batch context");
+      }
     }
     
     logger.info({ workerId, totalTabs: totalTabsOpened, totalPages: assignedEndPage - assignedStartPage + 1 }, "✅ All batches processed - all assigned page tabs opened and crawled");
@@ -1420,7 +1567,7 @@ const main = async (): Promise<void> => {
         await discoverAndProcessAssignedPages(page);
         
         logger.info({ interval: CHECK_INTERVAL, workerId }, "Waiting 5 seconds before next check...");
-      } catch (error) {
+  } catch (error) {
         const errorMessage = error instanceof Error ? error.message : String(error);
         const errorStack = error instanceof Error ? error.stack : undefined;
         logger.error({ error: errorMessage, stack: errorStack, workerId }, "Error in continuous check - will retry");
