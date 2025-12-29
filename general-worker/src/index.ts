@@ -1374,6 +1374,12 @@ const openAllPageTabsInBatches = async (page: Page, assignedStartPage: number, a
         totalTabsOpened += tabsOpened;
         logger.info({ workerId, batchStart, batchEnd, tabsOpened }, "✅ Batch tabs opened");
         
+        // Wait 10 seconds after opening batch to reduce rate limiting risk (except for last batch)
+        if (batchIndex < totalBatches - 1) {
+          logger.info({ workerId, batchStart, batchEnd, nextBatch: batchNumber + 1 }, "Waiting 10 seconds before opening next batch...");
+          await delay(10000); // 10 seconds
+        }
+        
         // Step 2: If not first batch, wait for previous batch to finish crawling, then close it
         if (batchIndex > 0) {
           const previousBatchStart = assignedStartPage + ((batchIndex - 1) * TABS_PER_BATCH);
