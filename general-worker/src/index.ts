@@ -765,7 +765,7 @@ const navigateToEncoreQueue = async (page: Page, retryCount = 0): Promise<void> 
 const openBatchOfTabs = async (targetContext: BrowserContext, batchStart: number, batchEnd: number, totalPages: number, tabsOpenedSoFar: number): Promise<number> => {
   logger.info({ batchStart, batchEnd, totalPages }, "Opening batch of page tabs");
   
-  // Open tabs sequentially with random delay between each tab for more human-like behavior
+  // Open tabs sequentially with random delay between each tab (faster for better performance)
   const startTime = Date.now();
   const batchSize = batchEnd - batchStart + 1;
   
@@ -779,10 +779,13 @@ const openBatchOfTabs = async (targetContext: BrowserContext, batchStart: number
   
   for (let pageNum = batchStart; pageNum <= batchEnd; pageNum++) {
     try {
-      // Add random delay before opening each tab (1-3 seconds as requested)
+      // Add random delay before opening each tab (faster for better performance)
       if (pageNum > batchStart) {
         const randomDelay = Math.floor(Math.random() * (delayMax - delayMin + 1)) + delayMin;
-        logger.debug({ pageNum, delay: randomDelay }, `Waiting ${randomDelay}ms before opening next tab`);
+        // Only log if delay is significant to reduce log noise
+        if (randomDelay >= 500) {
+          logger.debug({ pageNum, delay: randomDelay }, `Waiting ${randomDelay}ms before opening next tab`);
+        }
         await delay(randomDelay);
       }
       
@@ -1400,7 +1403,7 @@ const openAllPageTabsInBatches = async (page: Page, assignedStartPage: number, a
       await redisConnection.del(REDIS_KEY_BATCH_COMPLETE); // Clear completion flag
       await redisConnection.del(REDIS_KEY_TABS_READY); // Clear ready flag
       
-      // Open this batch of tabs (with 1-3 second random delay between each tab)
+      // Open this batch of tabs (with random delay between each tab for faster opening)
       const tabsOpened = await openBatchOfTabs(targetContext, batchStart, batchEnd, assignedEndPage, totalTabsOpened);
       totalTabsOpened += tabsOpened;
       
