@@ -693,6 +693,70 @@ const checkFor503Error = async (page: Page): Promise<boolean> => {
   }
 };
 
+const checkForRateLimit = async (page: Page): Promise<boolean> => {
+  try {
+    const url = page.url();
+    const vineBaseUrl = config.AMAZON_VINE_BASE_URL || "https://www.amazon.com/vine";
+    
+    // Only check for rate limit on Amazon/Vine pages
+    if (!url.includes("amazon.com")) {
+      return false;
+    }
+    
+    // Check for HTTP status codes (429 Too Many Requests, 503 Service Unavailable)
+    try {
+      const response = await page.waitForResponse(
+        (response) => {
+          const status = response.status();
+          return status === 429 || status === 503;
+        },
+        { timeout: 1000 }
+      ).catch(() => null);
+      
+      if (response) {
+        logger.warn({ status: response.status(), url: response.url() }, "Rate limit detected via HTTP status");
+        return true;
+      }
+    } catch {
+      // No rate limit response detected
+    }
+    
+    // Check for 503 error (already handled by checkFor503Error)
+    if (url.includes("vine")) {
+      const has503 = await checkFor503Error(page);
+      if (has503) {
+        return true;
+      }
+    }
+    
+    // Check page content for rate limit indicators
+    const rateLimitIndicators = await page.evaluate(() => {
+      const bodyText = document.body?.textContent?.toLowerCase() || "";
+      const title = document.title?.toLowerCase() || "";
+      
+      // Common rate limit indicators
+      const indicators = [
+        "too many requests",
+        "rate limit",
+        "429",
+        "503",
+        "service unavailable",
+        "temporarily unavailable",
+        "please try again later",
+        "throttled",
+      ];
+      
+      return indicators.some(indicator => 
+        bodyText.includes(indicator) || title.includes(indicator)
+      );
+    }).catch(() => false);
+    
+    return rateLimitIndicators;
+  } catch {
+    return false;
+  }
+};
+
 const navigateToEncoreQueue = async (page: Page, retryCount = 0): Promise<void> => {
   const currentUrl = page.url();
 
@@ -778,6 +842,25 @@ const openBatchOfTabs = async (targetContext: BrowserContext, batchStart: number
   
   for (let pageNum = batchStart; pageNum <= batchEnd; pageNum++) {
     try {
+      // Check for rate limiting before opening each tab
+      // Get a page from context to check rate limit
+      const existingPages = targetContext.pages();
+      if (existingPages.length > 0) {
+        const checkPage = existingPages[0];
+        const isRateLimited = await checkForRateLimit(checkPage);
+        if (isRateLimited) {
+          logger.warn({ pageNum, batchStart, batchEnd }, "⚠️ Rate limit detected while opening tabs! Waiting 5 minutes...");
+          await delay(300000); // Wait 5 minutes (300000ms)
+          logger.info({ pageNum }, "✅ Rate limit wait completed, continuing to open tabs...");
+          // Re-check after waiting
+          const stillRateLimited = await checkForRateLimit(checkPage);
+          if (stillRateLimited) {
+            logger.warn({ pageNum }, "⚠️ Still rate limited after wait, waiting another 5 minutes...");
+            await delay(300000);
+          }
+        }
+      }
+      
       // Add random delay before opening each tab (1-3 seconds as requested)
       if (pageNum > batchStart) {
         const randomDelay = Math.floor(Math.random() * (delayMax - delayMin + 1)) + delayMin;
@@ -792,14 +875,27 @@ const openBatchOfTabs = async (targetContext: BrowserContext, batchStart: number
       tab.goto(encoreUrl, { 
         waitUntil: "commit", // Fastest option - just wait for navigation to commit
         timeout: 30000 
-      }).catch(() => {
+      }).catch((error: any) => {
+        // Check if error is rate limit related
+        const errorMsg = error?.message || String(error);
+        if (errorMsg.includes("503") || errorMsg.includes("429") || errorMsg.includes("rate limit")) {
+          logger.warn({ pageNum, error: errorMsg }, "⚠️ Rate limit detected during navigation! Will wait in next iteration");
+        }
         // Navigation continues in background - non-blocking
       });
       
       logger.debug({ pageNum, encoreUrl }, `Opened tab for page ${pageNum}`);
     } catch (error: any) {
-      // Log error but continue
-      logger.warn({ error: error.message, pageNum }, "Failed to open tab");
+      // Check if error is rate limit related
+      const errorMsg = error?.message || String(error);
+      if (errorMsg.includes("503") || errorMsg.includes("429") || errorMsg.includes("rate limit")) {
+        logger.warn({ pageNum, error: errorMsg }, "⚠️ Rate limit detected! Waiting 5 minutes...");
+        await delay(300000); // Wait 5 minutes
+        logger.info({ pageNum }, "✅ Rate limit wait completed, continuing...");
+      } else {
+        // Log error but continue
+        logger.warn({ error: errorMsg, pageNum }, "Failed to open tab");
+      }
     }
   }
   
@@ -1076,23 +1172,135 @@ const openAllPageTabsInBatches = async (page: Page, assignedStartPage: number, a
     logger.info({ workerId, assignedStartPage, assignedEndPage, totalPages: assignedEndPage - assignedStartPage + 1 }, "Starting to open assigned page tabs in batches");
     
     const TABS_PER_BATCH = config.TABS_PER_BATCH || 20;
+    const MAX_TABS_BEFORE_CLEANUP = 100; // Memory optimization: close tabs when reaching 100
     let totalTabsOpened = 0;
     let previousBatchContext: BrowserContext | null = null;
-    const batchContexts: Array<{ batchStart: number; batchEnd: number; context: BrowserContext }> = [];
+    const batchContexts: Array<{ batchStart: number; batchEnd: number; context: BrowserContext; completed: boolean }> = [];
+    
+    // Helper function to count total open tabs across all contexts (only encore queue pages)
+    const countTotalOpenTabs = async (): Promise<number> => {
+      try {
+        const browserInstance = await getBrowser();
+        let totalTabs = 0;
+        const allContexts = browserInstance.contexts();
+        for (const ctx of allContexts) {
+          try {
+            const pages = ctx.pages();
+            // Count only encore queue pages (not DevTools or other pages)
+            for (const p of pages) {
+              if (!p.isClosed()) {
+                try {
+                  const url = p.url();
+                  if (url.includes("queue=encore") || url.includes("amazon.com/vine")) {
+                    totalTabs++;
+                  }
+                } catch {
+                  // Page might be closing, skip it
+                }
+              }
+            }
+          } catch {
+            // Context might be closed, skip it
+          }
+        }
+        return totalTabs;
+      } catch {
+        return 0;
+      }
+    };
+    
+    // Helper function to close completed batches (oldest first)
+    const closeCompletedBatches = async (): Promise<number> => {
+      // Find batches that are completed (product workers finished crawling)
+      const completedBatches = batchContexts.filter(b => b.completed);
+      
+      if (completedBatches.length === 0) {
+        return 0;
+      }
+      
+      // Sort by batch start (oldest first) - close oldest batches first
+      completedBatches.sort((a, b) => a.batchStart - b.batchStart);
+      
+      logger.info({ workerId, completedBatchesCount: completedBatches.length }, "Closing completed batches for memory optimization");
+      
+      let closedTabCount = 0;
+      for (const batch of completedBatches) {
+        try {
+          if (batch.context.isClosed()) {
+            // Context already closed, remove from tracking
+            const index = batchContexts.findIndex(b => b.batchStart === batch.batchStart && b.batchEnd === batch.batchEnd);
+            if (index !== -1) {
+              batchContexts.splice(index, 1);
+            }
+            continue;
+          }
+          
+          await closeBatchTabs(batch.context, batch.batchStart, batch.batchEnd);
+          closedTabCount += (batch.batchEnd - batch.batchStart + 1);
+          logger.info({ workerId, batchStart: batch.batchStart, batchEnd: batch.batchEnd }, "✅ Closed completed batch tabs");
+          
+          // Remove from tracking (batch is closed)
+          const index = batchContexts.findIndex(b => b.batchStart === batch.batchStart && b.batchEnd === batch.batchEnd);
+          if (index !== -1) {
+            batchContexts.splice(index, 1);
+      }
+    } catch (error) {
+          logger.warn({ error, batchStart: batch.batchStart }, "Failed to close completed batch");
+        }
+      }
+      
+      return closedTabCount;
+    };
     
     // Process assigned pages in batches
     for (let batchStart = assignedStartPage; batchStart <= assignedEndPage; batchStart += TABS_PER_BATCH) {
       const batchEnd = Math.min(batchStart + TABS_PER_BATCH - 1, assignedEndPage);
       const batchNumber = Math.ceil((batchStart - assignedStartPage) / TABS_PER_BATCH) + 1;
       
-      logger.info({ workerId, batchStart, batchEnd, assignedStartPage, assignedEndPage, batchNumber, tabsPerBatch: TABS_PER_BATCH }, "Starting new batch");
+      // Check for rate limiting before processing this batch
+      const isRateLimited = await checkForRateLimit(page);
+      if (isRateLimited) {
+        logger.warn({ workerId, batchStart, batchEnd }, "⚠️ Rate limit detected before processing batch! Waiting 5 minutes...");
+        await delay(300000); // Wait 5 minutes (300000ms)
+        logger.info({ workerId }, "✅ Rate limit wait completed, continuing with batch...");
+        // Re-check rate limit after waiting
+        const stillRateLimited = await checkForRateLimit(page);
+        if (stillRateLimited) {
+          logger.warn({ workerId }, "⚠️ Still rate limited after wait, waiting another 5 minutes...");
+          await delay(300000);
+        }
+      }
+      
+      // Check total open tabs - if reaching limit, wait and close completed batches
+      const currentTabCount = await countTotalOpenTabs();
+      if (currentTabCount >= MAX_TABS_BEFORE_CLEANUP) {
+        logger.info({ workerId, currentTabCount, maxTabs: MAX_TABS_BEFORE_CLEANUP }, "⚠️ Reached tab limit, waiting for product workers to finish and closing completed batches...");
+        
+        // Wait for product workers to complete current batches
+        await waitForBatchCompletion();
+        
+        // Mark all existing batches as completed (they've been crawled by product workers)
+        // We'll close the oldest batches first to free memory
+        for (const batch of batchContexts) {
+          if (!batch.completed) {
+            batch.completed = true;
+          }
+        }
+        
+        // Close completed batches to free memory (oldest first)
+        const closedTabCount = await closeCompletedBatches();
+        
+        // Re-check tab count after cleanup
+        const tabCountAfterCleanup = await countTotalOpenTabs();
+        logger.info({ workerId, tabsBefore: currentTabCount, tabsAfter: tabCountAfterCleanup, closedTabs: closedTabCount }, "✅ Memory cleanup completed");
+      }
       
       // Create new context with proxy for this batch (switches proxy for each batch)
       let targetContext: BrowserContext;
       if (config.USE_PROXY && config.PROXY_SERVER) {
         // Create new context with proxy for this batch
         targetContext = await createNewContextWithProxy(batchNumber);
-        batchContexts.push({ batchStart, batchEnd, context: targetContext });
+        batchContexts.push({ batchStart, batchEnd, context: targetContext, completed: false });
         logger.info({ workerId, batchStart, batchEnd, batchNumber }, "✅ Created new context with proxy for this batch");
       } else {
         // Use existing context if proxy is not enabled
@@ -1107,7 +1315,11 @@ const openAllPageTabsInBatches = async (page: Page, assignedStartPage: number, a
             throw new Error("No browser context available");
           }
         }
+        // Track this batch in the main context
+        batchContexts.push({ batchStart, batchEnd, context: targetContext, completed: false });
       }
+      
+      logger.info({ workerId, batchStart, batchEnd, assignedStartPage, assignedEndPage, batchNumber, tabsPerBatch: TABS_PER_BATCH, currentTabCount }, "Starting new batch");
       
       // Set current batch info in Redis
       await redisConnection.set(REDIS_KEY_CURRENT_BATCH_START, batchStart.toString());
@@ -1587,18 +1799,38 @@ const main = async (): Promise<void> => {
       await discoverAndProcessAssignedPages(page);
     }
     
-    // Set up continuous monitoring - check every 5 seconds for new assignments
-    const CHECK_INTERVAL = 5000; // 5 seconds
+    // Set up continuous monitoring - infinite loop for continuous processing
+    const CHECK_INTERVAL = 5000; // 5 seconds between checks
+    const RATE_LIMIT_WAIT_MS = 300000; // 5 minutes (300000ms) wait when rate limited
     
-    const continuousCheck = async () => {
+    const continuousCheck = async (): Promise<void> => {
       try {
         // Check if page is still open
         if (page.isClosed()) {
-          logger.warn({ workerId }, "Page was closed, cannot continue checking");
-          return; // Stop continuous checking if page is closed
+          logger.warn({ workerId }, "Page was closed, attempting to get new page...");
+          try {
+            const newPage = await getPage();
+            Object.assign(page, newPage); // Replace page reference
+            logger.info({ workerId }, "Got new page, continuing...");
+          } catch (error) {
+            logger.error({ error, workerId }, "Failed to get new page, will retry in next cycle");
+            setTimeout(continuousCheck, CHECK_INTERVAL);
+            return;
+          }
         }
         
-        // Check login status first
+        // Check for rate limiting first
+        const isRateLimited = await checkForRateLimit(page);
+        if (isRateLimited) {
+          logger.warn({ workerId }, "⚠️ Rate limit detected! Waiting 5 minutes before continuing...");
+          await delay(RATE_LIMIT_WAIT_MS);
+          logger.info({ workerId }, "✅ Rate limit wait completed, continuing...");
+          // Continue to next iteration
+          setTimeout(continuousCheck, CHECK_INTERVAL);
+          return;
+        }
+        
+        // Check login status
         const signedIn = await isSignedIn(page);
         if (!signedIn) {
           logger.info({ workerId }, "Not logged in yet, checking login status...");
@@ -1608,35 +1840,67 @@ const main = async (): Promise<void> => {
           } catch (loginError) {
             logger.debug({ workerId, error: loginError instanceof Error ? loginError.message : String(loginError) }, "Still waiting for login...");
             // Continue to next check - don't throw error
+            setTimeout(continuousCheck, CHECK_INTERVAL);
+            return;
           }
         }
         
         // Only proceed with discovery if logged in
-        if (signedIn || await isSignedIn(page)) {
+        const stillSignedIn = await isSignedIn(page);
+        if (stillSignedIn) {
+          // Check for rate limit again before processing
+          const rateLimitedBeforeProcessing = await checkForRateLimit(page);
+          if (rateLimitedBeforeProcessing) {
+            logger.warn({ workerId }, "⚠️ Rate limit detected before processing! Waiting 5 minutes...");
+            await delay(RATE_LIMIT_WAIT_MS);
+            setTimeout(continuousCheck, CHECK_INTERVAL);
+            return;
+          }
+          
           // Refresh the page to get latest data
           logger.info({ workerId }, "Refreshing page to get latest data...");
-          await page.reload({ waitUntil: "load", timeout: 60000 });
-          await delay(2000); // Wait for page to fully load
-          
-          // Discover and process assigned pages
-          await discoverAndProcessAssignedPages(page);
+          try {
+            await page.reload({ waitUntil: "load", timeout: 60000 });
+            await delay(2000); // Wait for page to fully load
+            
+            // Check for rate limit after reload
+            const rateLimitedAfterReload = await checkForRateLimit(page);
+            if (rateLimitedAfterReload) {
+              logger.warn({ workerId }, "⚠️ Rate limit detected after page reload! Waiting 5 minutes...");
+              await delay(RATE_LIMIT_WAIT_MS);
+              setTimeout(continuousCheck, CHECK_INTERVAL);
+              return;
+            }
+            
+            // Discover and process assigned pages (this will loop continuously)
+            await discoverAndProcessAssignedPages(page);
+          } catch (reloadError) {
+            const errorMessage = reloadError instanceof Error ? reloadError.message : String(reloadError);
+            // Check if it's a rate limit error
+            if (errorMessage.includes("503") || errorMessage.includes("429") || errorMessage.includes("rate limit")) {
+              logger.warn({ workerId, error: errorMessage }, "⚠️ Rate limit detected during page reload! Waiting 5 minutes...");
+              await delay(RATE_LIMIT_WAIT_MS);
+            } else {
+              logger.warn({ workerId, error: errorMessage }, "Error during page reload, will retry");
+            }
+          }
         }
         
-        logger.info({ interval: CHECK_INTERVAL, workerId }, "Waiting 5 seconds before next check...");
-  } catch (error) {
+        logger.info({ interval: CHECK_INTERVAL, workerId }, "Completed cycle, continuing loop...");
+      } catch (error) {
         const errorMessage = error instanceof Error ? error.message : String(error);
         const errorStack = error instanceof Error ? error.stack : undefined;
         logger.error({ error: errorMessage, stack: errorStack, workerId }, "Error in continuous check - will retry");
-        // Continue checking even if there's an error
+        // Continue checking even if there's an error - never stop the loop
       }
       
-      // Schedule next check
+      // Always schedule next check - infinite loop
       setTimeout(continuousCheck, CHECK_INTERVAL);
     };
     
-    // Start continuous checking
+    // Start continuous checking - infinite loop
     setTimeout(continuousCheck, CHECK_INTERVAL);
-    logger.info({ interval: CHECK_INTERVAL, workerId }, "Started continuous monitoring (every 5 seconds)");
+    logger.info({ interval: CHECK_INTERVAL, workerId }, "Started continuous monitoring loop (infinite loop, will process pages continuously)");
     
     // Keep the process alive
     const shutdown = async (): Promise<void> => {
