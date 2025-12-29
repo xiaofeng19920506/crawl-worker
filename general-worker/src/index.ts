@@ -93,6 +93,7 @@ const getBrowser = async (): Promise<Browser> => {
       args: [
         "--disable-blink-features=AutomationControlled",
         "--window-size=1920,1080",
+        "--remote-debugging-port=9222", // Enable CDP on port 9222 for Product Worker to connect
       ],
       viewport: { width: 1920, height: 1080 },
   };
@@ -1622,7 +1623,7 @@ const main = async (): Promise<void> => {
         }
         
         logger.info({ interval: CHECK_INTERVAL, workerId }, "Waiting 5 seconds before next check...");
-      } catch (error) {
+  } catch (error) {
         const errorMessage = error instanceof Error ? error.message : String(error);
         const errorStack = error instanceof Error ? error.stack : undefined;
         logger.error({ error: errorMessage, stack: errorStack, workerId }, "Error in continuous check - will retry");

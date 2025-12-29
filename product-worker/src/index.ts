@@ -38,6 +38,7 @@ const getBrowser = async (): Promise<Browser> => {
   }
 
   // Try to connect to existing Chrome browser via CDP first
+  // Priority 1: Use configured CDP endpoint
   if (config.PLAYWRIGHT_CDP_ENDPOINT) {
     try {
       logger.info({ endpoint: config.PLAYWRIGHT_CDP_ENDPOINT }, "Attempting to connect to existing Chrome via CDP");
@@ -89,26 +90,61 @@ const getBrowser = async (): Promise<Browser> => {
         errorDetails = error;
       }
       
-      logger.error({ 
+      logger.warn({ 
         error: errorMsg,
         errorDetails,
         endpoint: config.PLAYWRIGHT_CDP_ENDPOINT,
-      }, "Failed to connect via CDP, will launch new browser");
-      
-      // If it's a network error, provide helpful message
-      if (errorMsg.includes("fetch") || errorMsg.includes("ECONNREFUSED") || errorMsg.includes("timeout") || errorMsg.includes("aborted") || errorMsg.includes("network") || errorMsg.includes("Failed to fetch")) {
-        logger.error("Chrome remote debugging is not accessible. Make sure Chrome is started with --remote-debugging-port=9222");
-        logger.error("You can verify by opening: http://localhost:9222/json/version in your browser");
-      }
+      }, "Failed to connect via configured CDP endpoint, will try default CDP port");
     }
-  } else {
-    logger.info("PLAYWRIGHT_CDP_ENDPOINT not configured, will launch new browser");
   }
+  
+  // Priority 2: Try to connect to General Worker's browser via default CDP port (9222)
+  // This allows Product Worker to connect to General Worker's browser without configuration
+  try {
+    const defaultCdpEndpoint = "http://localhost:9222";
+    logger.info({ endpoint: defaultCdpEndpoint }, "Attempting to connect to General Worker's browser via CDP (default port 9222)");
+    
+    const controller = new AbortController();
+    const timeoutId = setTimeout(() => controller.abort(), 3000); // Shorter timeout for default port
+    
+    const response = await fetch(`${defaultCdpEndpoint}/json/version`, {
+      signal: controller.signal,
+    });
+    clearTimeout(timeoutId);
+    
+    if (!response.ok) {
+      throw new Error(`Failed to fetch Chrome version: ${response.status} ${response.statusText}`);
+    }
+    
+    const chromeInfo = await response.json();
+    const wsEndpoint = chromeInfo.webSocketDebuggerUrl;
+    
+    if (!wsEndpoint) {
+      throw new Error("No WebSocket debugger URL found in Chrome response");
+    }
+    
+    logger.info({ wsEndpoint }, "Connecting to General Worker's browser via CDP");
+    browser = await chromium.connectOverCDP(wsEndpoint);
+    
+    if (browser && browser.isConnected()) {
+      logger.info("✅ Successfully connected to General Worker's browser via CDP");
+      return browser;
+    } else {
+      throw new Error("Browser connected but isConnected() returned false");
+    }
+  } catch (error: any) {
+    // CDP connection failed - this is expected if General Worker hasn't enabled CDP
+    logger.debug({ error: error instanceof Error ? error.message : String(error) }, "Could not connect via CDP (General Worker may not have CDP enabled), will launch own browser");
+  }
+  
+  // Priority 3: Launch own browser with separate directory to avoid conflicts
+  logger.info("Will launch new browser with separate directory to avoid conflicts with General Worker");
 
   // Fall back to launching a new browser with persistent context
-  // Try to use the same directory as General Worker so we can share the browser context
-  // This allows Product Worker to access pages opened by General Worker
-  const userDataDir = config.PLAYWRIGHT_USER_DATA_DIR || "./browser-data";
+  // Use a separate directory for product worker to avoid conflicts with general worker
+  // Note: If General Worker enables CDP, Product Worker should connect via CDP instead
+  const baseUserDataDir = config.PLAYWRIGHT_USER_DATA_DIR || "./browser-data";
+  const userDataDir = `${baseUserDataDir}-product`;
   const chromePath = config.PLAYWRIGHT_CHROME_EXECUTABLE_PATH;
   
   logger.info({ 
