@@ -811,6 +811,102 @@ const openBatchOfTabs = async (targetContext: BrowserContext, batchStart: number
   return batchSize;
 };
 
+// Refresh all tabs with proxy switching (production mode only)
+const refreshAllTabsWithProxy = async (): Promise<void> => {
+  const workerId = config.GENERAL_WORKER_ID || 1;
+  const isProduction = config.NODE_ENV === "production";
+  
+  if (!isProduction) {
+    logger.warn({ workerId }, "refreshAllTabsWithProxy called in non-production mode, skipping");
+            return;
+          }
+
+  try {
+    logger.info({ workerId, mode: "production" }, "Starting to refresh all tabs with proxy switching...");
+    
+    const browserInstance = await getBrowser();
+    const allContexts = browserInstance.contexts();
+    
+    // Get all encore queue pages across all contexts
+    const allPages: Page[] = [];
+    for (const ctx of allContexts) {
+      try {
+        const pages = ctx.pages();
+        for (const p of pages) {
+          if (!p.isClosed()) {
+            try {
+              const url = p.url();
+              if (url.includes("queue=encore") || url.includes("amazon.com/vine")) {
+                allPages.push(p);
+              }
+            } catch {
+              // Skip if page is closing
+            }
+          }
+        }
+      } catch {
+        // Context might be closed, skip it
+      }
+    }
+    
+    logger.info({ workerId, totalTabs: allPages.length, mode: "production" }, "Found tabs to refresh");
+    
+    // If proxy is enabled, create a new context with proxy for refreshing
+    if (config.USE_PROXY && config.PROXY_SERVER) {
+      // Create a new context with proxy
+      const refreshContext = await createNewContextWithProxy(Date.now()); // Use timestamp as batch number for uniqueness
+      logger.info({ workerId, mode: "production" }, "Created new context with proxy for refresh");
+      
+      // Refresh all pages in parallel
+      const refreshPromises = allPages.map(async (p) => {
+        try {
+          if (!p.isClosed()) {
+            await p.reload({ waitUntil: "load", timeout: 30000 });
+            logger.debug({ workerId, url: p.url() }, "Refreshed tab");
+          }
+        } catch (error) {
+          logger.warn({ workerId, error, url: p.url() }, "Failed to refresh tab");
+        }
+      });
+      
+      await Promise.all(refreshPromises);
+      logger.info({ workerId, refreshedTabs: allPages.length, mode: "production" }, "✅ Refreshed all tabs");
+      
+      // Close the refresh context after a delay (it was just for proxy switching)
+      setTimeout(async () => {
+        try {
+          await refreshContext.close();
+          logger.info({ workerId }, "Closed refresh context");
+        } catch (error) {
+          logger.warn({ error }, "Failed to close refresh context");
+        }
+      }, 5000);
+    } else {
+      // No proxy - just refresh all pages
+      const refreshPromises = allPages.map(async (p) => {
+        try {
+          if (!p.isClosed()) {
+            await p.reload({ waitUntil: "load", timeout: 30000 });
+            logger.debug({ workerId, url: p.url() }, "Refreshed tab");
+          }
+        } catch (error) {
+          logger.warn({ workerId, error, url: p.url() }, "Failed to refresh tab");
+        }
+      });
+      
+      await Promise.all(refreshPromises);
+      logger.info({ workerId, refreshedTabs: allPages.length, mode: "production" }, "✅ Refreshed all tabs (no proxy)");
+    }
+    
+    // Trigger product workers to crawl refreshed pages
+    await redisConnection.set(REDIS_KEY_CRAWL_TRIGGER, "1");
+    logger.info({ workerId, mode: "production" }, "✅ Triggered product workers to crawl refreshed pages");
+  } catch (error) {
+    const errorMessage = error instanceof Error ? error.message : String(error);
+    logger.error({ error: errorMessage, workerId, mode: "production" }, "Failed to refresh all tabs with proxy");
+  }
+};
+
 const closeBatchTabs = async (targetContext: BrowserContext, batchStart: number, batchEnd: number): Promise<void> => {
   const workerId = config.GENERAL_WORKER_ID || 1;
   logger.info({ workerId, batchStart, batchEnd }, "Closing tabs for completed batch");
@@ -900,8 +996,8 @@ const closeBatchTabs = async (targetContext: BrowserContext, batchStart: number,
           // Ignore errors on retry
         }
       }
-    }
-  } catch (error) {
+      }
+    } catch (error) {
     logger.error({ error, workerId, batchStart, batchEnd }, "Error closing batch tabs");
     // Don't throw - continue to next batch even if closing fails
   }
@@ -1081,13 +1177,15 @@ const waitForBatchCompletion = async (): Promise<void> => {
   }
 };
 
-const openAllPageTabsInBatches = async (page: Page, assignedStartPage: number, assignedEndPage: number): Promise<void> => {
+const openAllPageTabsInBatches = async (page: Page, assignedStartPage: number, assignedEndPage: number, onFirstLoopComplete?: () => void): Promise<void> => {
   const workerId = config.GENERAL_WORKER_ID || 1;
   try {
     logger.info({ workerId, assignedStartPage, assignedEndPage, totalPages: assignedEndPage - assignedStartPage + 1 }, "Starting to open assigned page tabs in batches");
     
     const TABS_PER_BATCH = config.TABS_PER_BATCH || 20;
     const MAX_TABS_BEFORE_CLEANUP = 100; // Memory optimization: close tabs when reaching 100
+    const isDevelopment = config.NODE_ENV === "development";
+    const isProduction = config.NODE_ENV === "production";
     let totalTabsOpened = 0;
     let previousBatchContext: BrowserContext | null = null;
     const batchContexts: Array<{ batchStart: number; batchEnd: number; context: BrowserContext; completed: boolean }> = [];
@@ -1172,28 +1270,50 @@ const openAllPageTabsInBatches = async (page: Page, assignedStartPage: number, a
       const batchEnd = Math.min(batchStart + TABS_PER_BATCH - 1, assignedEndPage);
       const batchNumber = Math.ceil((batchStart - assignedStartPage) / TABS_PER_BATCH) + 1;
       
-      // Check total open tabs - if reaching limit, wait and close completed batches
-      const currentTabCount = await countTotalOpenTabs();
-      if (currentTabCount >= MAX_TABS_BEFORE_CLEANUP) {
-        logger.info({ workerId, currentTabCount, maxTabs: MAX_TABS_BEFORE_CLEANUP }, "⚠️ Reached tab limit, waiting for product workers to finish and closing completed batches...");
-        
-        // Wait for product workers to complete current batches
-        await waitForBatchCompletion();
-        
-        // Mark all existing batches as completed (they've been crawled by product workers)
-        // We'll close the oldest batches first to free memory
-        for (const batch of batchContexts) {
-          if (!batch.completed) {
-            batch.completed = true;
+      // Check total open tabs - only close tabs in development mode
+      // In production mode, keep all tabs open and refresh them instead
+      if (isDevelopment) {
+        const currentTabCount = await countTotalOpenTabs();
+        if (currentTabCount >= MAX_TABS_BEFORE_CLEANUP) {
+          logger.info({ workerId, currentTabCount, maxTabs: MAX_TABS_BEFORE_CLEANUP, mode: "development" }, "⚠️ Reached tab limit (development mode), waiting for product workers to finish and closing completed batches...");
+          
+          // Wait for product workers to complete current batches
+          await waitForBatchCompletion();
+          
+          // Mark all existing batches as completed (they've been crawled by product workers)
+          // We'll close the oldest batches first to free memory
+          for (const batch of batchContexts) {
+            if (!batch.completed) {
+              batch.completed = true;
+            }
+          }
+          
+          // Close completed batches to free memory (oldest first)
+          const closedTabCount = await closeCompletedBatches();
+          
+          // Re-check tab count after cleanup
+          const tabCountAfterCleanup = await countTotalOpenTabs();
+          logger.info({ workerId, tabsBefore: currentTabCount, tabsAfter: tabCountAfterCleanup, closedTabs: closedTabCount }, "✅ Memory cleanup completed (development mode)");
+        } else {
+          // Even if we haven't reached the limit, close old completed batches periodically
+          // This ensures we don't accumulate too many tabs
+          // Check if we have any completed batches that can be closed
+          const completedBatches = batchContexts.filter(b => b.completed);
+          if (completedBatches.length > 0 && currentTabCount > TABS_PER_BATCH * 2) {
+            // If we have more than 2 batches worth of tabs, close old completed batches
+            logger.info({ workerId, currentTabCount, completedBatches: completedBatches.length, mode: "development" }, "Closing old completed batches to free memory...");
+            const closedTabCount = await closeCompletedBatches();
+            if (closedTabCount > 0) {
+              logger.info({ workerId, closedTabs: closedTabCount, mode: "development" }, "✅ Closed old completed batches");
+            }
           }
         }
-        
-        // Close completed batches to free memory (oldest first)
-        const closedTabCount = await closeCompletedBatches();
-        
-        // Re-check tab count after cleanup
-        const tabCountAfterCleanup = await countTotalOpenTabs();
-        logger.info({ workerId, tabsBefore: currentTabCount, tabsAfter: tabCountAfterCleanup, closedTabs: closedTabCount }, "✅ Memory cleanup completed");
+      } else {
+        // Production mode: don't close tabs, just log the count
+        const currentTabCount = await countTotalOpenTabs();
+        if (currentTabCount >= MAX_TABS_BEFORE_CLEANUP) {
+          logger.info({ workerId, currentTabCount, maxTabs: MAX_TABS_BEFORE_CLEANUP, mode: "production" }, "⚠️ Reached tab limit (production mode), keeping tabs open for refresh cycle");
+        }
       }
       
       // Create new context with proxy for this batch (switches proxy for each batch)
@@ -1244,9 +1364,10 @@ const openAllPageTabsInBatches = async (page: Page, assignedStartPage: number, a
       await redisConnection.set(REDIS_KEY_CRAWL_TRIGGER, "1");
       logger.info({ workerId, batchStart, batchEnd }, "✅ Tabs ready - assigned pages and triggered product workers to crawl this batch (workers will crawl in parallel)");
       
-      // Close previous batch's context if it exists and proxy is enabled
-      // This allows workers to continue crawling the previous batch while we open the next batch
-      if (previousBatchContext && config.USE_PROXY && config.PROXY_SERVER) {
+      // Close previous batch's context only in development mode
+      // In production mode, keep all contexts open for refresh cycle
+      if (isDevelopment && previousBatchContext) {
+        // In development mode, always close previous batch (with or without proxy)
         // Don't close immediately - let workers finish crawling
         // We'll close it after a delay to ensure workers have started
         setTimeout(async () => {
@@ -1255,22 +1376,29 @@ const openAllPageTabsInBatches = async (page: Page, assignedStartPage: number, a
             const prevBatch = batchContexts.find(b => b.context === previousBatchContext);
             if (prevBatch) {
               await closeBatchTabs(previousBatchContext, prevBatch.batchStart, prevBatch.batchEnd);
-              logger.info({ workerId, batchStart: prevBatch.batchStart, batchEnd: prevBatch.batchEnd }, "✅ Closed previous batch tabs");
+              logger.info({ workerId, batchStart: prevBatch.batchStart, batchEnd: prevBatch.batchEnd, mode: "development" }, "✅ Closed previous batch tabs");
               
-              // Close the context after a delay to ensure workers finished
-              setTimeout(async () => {
-                try {
-                  await previousBatchContext.close();
-                  logger.info({ workerId }, "✅ Closed previous batch context");
-    } catch (error) {
-                  logger.warn({ error }, "Failed to close previous batch context");
-                }
-              }, 5000); // Wait 5 seconds before closing context
+              // Close the context after a delay to ensure workers finished (only if using proxy)
+              // If not using proxy, we're using the same context, so don't close it
+              if (config.USE_PROXY && config.PROXY_SERVER) {
+                setTimeout(async () => {
+                  try {
+                    await previousBatchContext.close();
+                    logger.info({ workerId }, "✅ Closed previous batch context");
+                  } catch (error) {
+                    logger.warn({ error }, "Failed to close previous batch context");
+                  }
+                }, 5000); // Wait 5 seconds before closing context
+              } else {
+                logger.debug({ workerId, mode: "development" }, "Not closing context (no proxy - using shared context)");
+              }
             }
           } catch (error) {
             logger.warn({ error }, "Failed to close previous batch");
           }
         }, 2000); // Wait 2 seconds before starting to close previous batch
+      } else if (isProduction && previousBatchContext) {
+        logger.debug({ workerId, mode: "production" }, "Keeping previous batch context open for refresh cycle");
       }
       
       // Update previous batch context for next iteration
@@ -1286,22 +1414,40 @@ const openAllPageTabsInBatches = async (page: Page, assignedStartPage: number, a
     logger.info({ workerId }, "Waiting for final batch to complete...");
     await waitForBatchCompletion();
     
-    // Close the last batch's context if using proxy
-    if (previousBatchContext && config.USE_PROXY && config.PROXY_SERVER) {
+    // Close the last batch's context only in development mode
+    if (isDevelopment && previousBatchContext) {
       const lastBatch = batchContexts[batchContexts.length - 1];
       if (lastBatch) {
         await closeBatchTabs(previousBatchContext, lastBatch.batchStart, lastBatch.batchEnd);
         await delay(2000);
-        await previousBatchContext.close();
-        logger.info({ workerId }, "✅ Closed final batch context");
+        // Only close context if using proxy (separate contexts)
+        // If not using proxy, we're using the shared context, so don't close it
+        if (config.USE_PROXY && config.PROXY_SERVER) {
+          await previousBatchContext.close();
+          logger.info({ workerId, mode: "development" }, "✅ Closed final batch context");
+        } else {
+          logger.debug({ workerId, mode: "development" }, "Not closing final context (no proxy - using shared context)");
+        }
       }
     }
     
-    logger.info({ workerId, totalTabs: totalTabsOpened, totalPages: assignedEndPage - assignedStartPage + 1 }, "✅ All batches processed - all assigned page tabs opened and crawled");
+    logger.info({ workerId, totalTabs: totalTabsOpened, totalPages: assignedEndPage - assignedStartPage + 1, mode: isProduction ? "production" : "development" }, "✅ All batches processed - all assigned page tabs opened and crawled");
     
-    // Mark this general worker as complete
-    await redisConnection.set(REDIS_KEY_GENERAL_WORKER_COMPLETE(workerId), "1");
-    logger.info({ workerId }, "✅ General worker completed assigned page range");
+    // Mark first loop as completed (for production mode refresh cycle)
+    if (onFirstLoopComplete) {
+      onFirstLoopComplete();
+    }
+    
+    // In production mode, start refresh cycle after first loop
+    if (isProduction) {
+      logger.info({ workerId, mode: "production" }, "✅ First loop completed. Starting refresh cycle with proxy switching...");
+      // Don't mark as complete - we'll continue with refresh cycle
+      // The refresh cycle will be handled in the continuous check loop
+    } else {
+      // Mark this general worker as complete in development mode
+      await redisConnection.set(REDIS_KEY_GENERAL_WORKER_COMPLETE(workerId), "1");
+      logger.info({ workerId, mode: "development" }, "✅ General worker completed assigned page range");
+    }
   } catch (error) {
     const currentWorkerId = config.GENERAL_WORKER_ID || 1;
     logger.error({ error, workerId: currentWorkerId }, "Failed to open page tabs in batches");
@@ -1349,7 +1495,7 @@ const crawlAndCheck = async (page: Page): Promise<void> => {
 let isProcessing = false;
 let lastProcessedRange: { start: number; end: number } | null = null;
 
-const discoverAndProcessAssignedPages = async (page: Page): Promise<void> => {
+const discoverAndProcessAssignedPages = async (page: Page, onFirstLoopComplete?: () => void): Promise<void> => {
   const workerId = config.GENERAL_WORKER_ID || 1;
   
   // Prevent duplicate processing
@@ -1408,7 +1554,7 @@ const discoverAndProcessAssignedPages = async (page: Page): Promise<void> => {
     
     try {
       // Process assigned page range
-      await openAllPageTabsInBatches(page, assignedRange.start, assignedRange.end);
+      await openAllPageTabsInBatches(page, assignedRange.start, assignedRange.end, onFirstLoopComplete);
       
       logger.info({ workerId, assignedRange }, "✅ Completed processing assigned page range");
     } finally {
@@ -1561,6 +1707,9 @@ const main = async (): Promise<void> => {
   logger.info({ workerId }, `🚀 General Worker #${workerId} starting...`);
   logger.info({ workerId }, "Standalone worker - will discover pages, send heartbeats to manager, and process assigned page ranges");
   
+  // Track if first loop is completed (for production mode refresh cycle)
+  let firstLoopCompleted = false;
+  
   // Start heartbeat loop - send heartbeat every 10 seconds
   const HEARTBEAT_INTERVAL = 10000; // 10 seconds
   const LOCK_TTL_SECONDS = 60; // Lock TTL matches the one used in checkForDuplicateWorker
@@ -1697,7 +1846,9 @@ const main = async (): Promise<void> => {
     
     // Initial discovery and processing (only if logged in)
     if (loggedIn) {
-      await discoverAndProcessAssignedPages(page);
+      await discoverAndProcessAssignedPages(page, () => {
+        firstLoopCompleted = true;
+      });
     }
     
     // Set up continuous monitoring - infinite loop for continuous processing
@@ -1737,17 +1888,58 @@ const main = async (): Promise<void> => {
         // Only proceed with discovery if logged in
         const stillSignedIn = await isSignedIn(page);
         if (stillSignedIn) {
-          // Refresh the page to get latest data
-          logger.info({ workerId }, "Refreshing page to get latest data...");
-          try {
-            await page.reload({ waitUntil: "load", timeout: 60000 });
-            await delay(2000); // Wait for page to fully load
+          // In production mode, after first loop, check for changes and refresh tabs
+          if (isProduction && firstLoopCompleted) {
+            // Get current totalPages and totalProducts from Redis
+            const currentTotalPagesStr = await redisConnection.get(REDIS_KEY_TOTAL_PAGES);
+            const currentTotalProductsStr = await redisConnection.get(REDIS_KEY_TOTAL_PRODUCTS);
             
-            // Discover and process assigned pages (this will loop continuously)
-            await discoverAndProcessAssignedPages(page);
-          } catch (reloadError) {
-            const errorMessage = reloadError instanceof Error ? reloadError.message : String(reloadError);
-            logger.warn({ workerId, error: errorMessage }, "Error during page reload, will retry");
+            // Discover new values
+            const { totalPages: newTotalPages, totalProducts: newTotalProducts } = await discoverPageInfo(page);
+            
+            // Update Redis with new values
+            await redisConnection.set(REDIS_KEY_TOTAL_PAGES, newTotalPages.toString());
+            await redisConnection.set(REDIS_KEY_TOTAL_PRODUCTS, newTotalProducts.toString());
+            
+            const currentTotalPages = currentTotalPagesStr ? parseInt(currentTotalPagesStr, 10) : 0;
+            const currentTotalProducts = currentTotalProductsStr ? parseInt(currentTotalProductsStr, 10) : 0;
+            
+            const pagesChanged = currentTotalPages !== newTotalPages;
+            const productsChanged = currentTotalProducts !== newTotalProducts;
+            
+            if (pagesChanged || productsChanged) {
+              logger.info({ 
+                workerId, 
+                mode: "production",
+                oldPages: currentTotalPages, 
+                newPages: newTotalPages,
+                oldProducts: currentTotalProducts,
+                newProducts: newTotalProducts,
+                pagesChanged,
+                productsChanged
+              }, "⚠️ Detected changes in totalPages or totalProducts! Refreshing all tabs with new proxy...");
+              
+              // Refresh all tabs with proxy switching
+              await refreshAllTabsWithProxy();
+            } else {
+              logger.debug({ workerId, mode: "production", totalPages: newTotalPages, totalProducts: newTotalProducts }, "No changes detected, continuing monitoring...");
+            }
+          } else {
+            // Normal discovery and processing (first loop or development mode)
+            // Refresh the page to get latest data
+            logger.info({ workerId }, "Refreshing page to get latest data...");
+            try {
+              await page.reload({ waitUntil: "load", timeout: 60000 });
+              await delay(2000); // Wait for page to fully load
+              
+              // Discover and process assigned pages (this will loop continuously)
+              await discoverAndProcessAssignedPages(page, () => {
+                firstLoopCompleted = true;
+              });
+            } catch (reloadError) {
+              const errorMessage = reloadError instanceof Error ? reloadError.message : String(reloadError);
+              logger.warn({ workerId, error: errorMessage }, "Error during page reload, will retry");
+            }
           }
         }
         
