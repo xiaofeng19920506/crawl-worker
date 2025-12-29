@@ -1547,27 +1547,82 @@ const main = async (): Promise<void> => {
       logger.info({ url: currentUrl }, "Already on Amazon page");
     }
     
-    await ensureLoggedIn(page);
-    logger.info({ url: page.url() }, "After ensureLoggedIn, current URL");
+    // Try to ensure logged in - if it fails, keep retrying instead of exiting
+    let loggedIn = false;
+    let loginAttempts = 0;
+    const MAX_LOGIN_ATTEMPTS = 10; // Try up to 10 times (50 minutes total)
     
-    // Initial discovery and processing
-    await discoverAndProcessAssignedPages(page);
+    while (!loggedIn && loginAttempts < MAX_LOGIN_ATTEMPTS) {
+      try {
+    await ensureLoggedIn(page);
+        loggedIn = true;
+        logger.info({ url: page.url() }, "After ensureLoggedIn, current URL");
+      } catch (loginError) {
+        loginAttempts++;
+        const errorMessage = loginError instanceof Error ? loginError.message : String(loginError);
+        logger.warn({ workerId, attempt: loginAttempts, maxAttempts: MAX_LOGIN_ATTEMPTS, error: errorMessage }, "Login failed, will retry...");
+        
+        // Wait 30 seconds before retrying (give user more time to login)
+        logger.info({ workerId, waitTime: 30000 }, "Waiting 30 seconds before retrying login check...");
+        await delay(30000);
+        
+        // Check if page is still open
+        if (page.isClosed()) {
+          logger.error({ workerId }, "Page was closed, cannot continue");
+          throw new Error("Page was closed during login retry");
+        }
+      }
+    }
+    
+    if (!loggedIn) {
+      logger.error({ workerId, attempts: loginAttempts }, "Failed to login after multiple attempts. Please check the browser and try again.");
+      // Don't exit - keep the browser open so user can manually login
+      // The continuous check will retry later
+      logger.info({ workerId }, "Worker will continue running. Please login manually and the worker will detect it on the next check.");
+    }
+    
+    // Initial discovery and processing (only if logged in)
+    if (loggedIn) {
+      await discoverAndProcessAssignedPages(page);
+    }
     
     // Set up continuous monitoring - check every 5 seconds for new assignments
     const CHECK_INTERVAL = 5000; // 5 seconds
     
     const continuousCheck = async () => {
       try {
-        // Refresh the page to get latest data
-        logger.info({ workerId }, "Refreshing page to get latest data...");
-        await page.reload({ waitUntil: "load", timeout: 60000 });
-        await delay(2000); // Wait for page to fully load
+        // Check if page is still open
+        if (page.isClosed()) {
+          logger.warn({ workerId }, "Page was closed, cannot continue checking");
+          return; // Stop continuous checking if page is closed
+        }
         
-        // Discover and process assigned pages
-        await discoverAndProcessAssignedPages(page);
+        // Check login status first
+        const signedIn = await isSignedIn(page);
+        if (!signedIn) {
+          logger.info({ workerId }, "Not logged in yet, checking login status...");
+          try {
+            await ensureLoggedIn(page);
+            logger.info({ workerId }, "✅ Login detected during continuous check!");
+          } catch (loginError) {
+            logger.debug({ workerId, error: loginError instanceof Error ? loginError.message : String(loginError) }, "Still waiting for login...");
+            // Continue to next check - don't throw error
+          }
+        }
+        
+        // Only proceed with discovery if logged in
+        if (signedIn || await isSignedIn(page)) {
+          // Refresh the page to get latest data
+          logger.info({ workerId }, "Refreshing page to get latest data...");
+          await page.reload({ waitUntil: "load", timeout: 60000 });
+          await delay(2000); // Wait for page to fully load
+          
+          // Discover and process assigned pages
+          await discoverAndProcessAssignedPages(page);
+        }
         
         logger.info({ interval: CHECK_INTERVAL, workerId }, "Waiting 5 seconds before next check...");
-  } catch (error) {
+      } catch (error) {
         const errorMessage = error instanceof Error ? error.message : String(error);
         const errorStack = error instanceof Error ? error.stack : undefined;
         logger.error({ error: errorMessage, stack: errorStack, workerId }, "Error in continuous check - will retry");
