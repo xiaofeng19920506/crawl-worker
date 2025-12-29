@@ -106,6 +106,8 @@ const getBrowser = async (): Promise<Browser> => {
   }
 
   // Fall back to launching a new browser with persistent context
+  // Try to use the same directory as General Worker so we can share the browser context
+  // This allows Product Worker to access pages opened by General Worker
   const userDataDir = config.PLAYWRIGHT_USER_DATA_DIR || "./browser-data";
   const chromePath = config.PLAYWRIGHT_CHROME_EXECUTABLE_PATH;
   
@@ -151,19 +153,47 @@ const getBrowser = async (): Promise<Browser> => {
     launchOptions.args.push("--no-sandbox", "--disable-setuid-sandbox", "--disable-dev-shm-usage");
   }
   
-  context = await chromium.launchPersistentContext(userDataDir, launchOptions);
-  browser = context.browser();
-  if (!browser) {
-    throw new Error("Failed to get browser from persistent context");
+  try {
+    context = await chromium.launchPersistentContext(userDataDir, launchOptions);
+    browser = context.browser();
+    if (!browser) {
+      throw new Error("Failed to get browser from persistent context");
+    }
+    
+    // Load shared cookies immediately after creating context (for different servers)
+    await loadSharedCookies(context).catch(() => {
+      logger.debug("No shared cookies available yet, will load on first login");
+    });
+    
+    logger.info("Successfully launched new browser");
+    return browser;
+  } catch (error: any) {
+    // Extract detailed error information
+    let errorMsg = "Unknown error";
+    let errorDetails: any = {};
+    
+    if (error instanceof Error) {
+      errorMsg = error.message;
+      errorDetails = {
+        name: error.name,
+        stack: error.stack,
+      };
+    } else if (typeof error === "string") {
+      errorMsg = error;
+    } else if (error && typeof error === "object") {
+      errorMsg = error.message || error.toString() || JSON.stringify(error);
+      errorDetails = error;
+    }
+    
+    logger.error({ 
+      error: errorMsg,
+      errorDetails,
+      userDataDir,
+      headless: config.PLAYWRIGHT_HEADLESS,
+    }, "Failed to launch browser with persistent context");
+    
+    throw new Error(`Failed to launch browser: ${errorMsg}`);
   }
-  
-  // Load shared cookies immediately after creating context (for different servers)
-  await loadSharedCookies(context).catch(() => {
-    logger.debug("No shared cookies available yet, will load on first login");
-  });
-  
-  logger.info("Successfully launched new browser");
-  return browser;
 };
 
 const loadSharedCookies = async (targetContext: BrowserContext): Promise<boolean> => {
@@ -756,18 +786,51 @@ const crawlAllPages = async (): Promise<void> => {
     
     // Get browser instance to access contexts
     const browserInstance = await getBrowser();
-    let targetContext: BrowserContext;
+    let targetContext: BrowserContext | null = null;
     
-    // Use existing context if available, otherwise get/create one
-    if (context) {
-      targetContext = context;
-    } else {
-      const contexts = browserInstance.contexts();
-      if (contexts.length > 0) {
-        targetContext = contexts[0];
+    // First, try to find General Worker's context by looking for pages with encore URLs
+    // Check all contexts to find the one with General Worker's tabs
+    const allContexts = browserInstance.contexts();
+    logger.info({ contextsCount: allContexts.length }, "Checking all browser contexts for General Worker's tabs...");
+    
+    for (const ctx of allContexts) {
+      try {
+        const pages = ctx.pages();
+        // Check if this context has any pages with encore URLs (opened by General Worker)
+        const hasEncorePages = pages.some(page => {
+          try {
+            if (page.isClosed()) return false;
+            const url = page.url();
+            return url.includes("queue=encore") || url.includes("amazon.com/vine");
+          } catch {
+            return false;
+          }
+        });
+        
+        if (hasEncorePages) {
+          targetContext = ctx;
+          logger.info({ contextPages: pages.length }, "✅ Found General Worker's context with encore pages!");
+          break;
+        }
+      } catch (error) {
+        logger.debug({ error }, "Error checking context");
+      }
+    }
+    
+    // If we found General Worker's context, use it
+    // Otherwise, fall back to our own context
+    if (!targetContext) {
+      if (context) {
+        targetContext = context;
+        logger.info("Using Product Worker's own context (General Worker's context not found)");
       } else {
-        logger.error("No browser context available. General worker should have opened tabs.");
-        return;
+        if (allContexts.length > 0) {
+          targetContext = allContexts[0];
+          logger.info("Using first available context");
+        } else {
+          logger.error("No browser context available. General worker should have opened tabs.");
+          return;
+        }
       }
     }
   
@@ -1106,8 +1169,14 @@ const main = async (): Promise<void> => {
 
   try {
     // Initialize browser
-    await getBrowser();
-    logger.info("Browser initialized");
+    try {
+      await getBrowser();
+      logger.info("Browser initialized");
+    } catch (browserError: any) {
+      const errorMessage = browserError instanceof Error ? browserError.message : String(browserError);
+      logger.error({ error: errorMessage, workerId }, "Failed to initialize browser");
+      throw browserError; // Re-throw to be caught by outer catch
+    }
     
     // Check if we should crawl immediately (on startup or if trigger is set)
     await checkAndCrawlIfNeeded();
@@ -1303,7 +1372,14 @@ const main = async (): Promise<void> => {
 
     logger.info("Product worker started and ready");
   } catch (error) {
-    logger.error({ error }, "Product worker failed to start");
+    const errorMessage = error instanceof Error ? error.message : String(error);
+    const errorStack = error instanceof Error ? error.stack : undefined;
+    logger.error({ 
+      error: errorMessage, 
+      stack: errorStack,
+      rawError: error,
+      workerId 
+    }, "Product worker failed to start");
     process.exit(1);
   }
 };
