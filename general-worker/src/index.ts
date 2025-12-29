@@ -1270,10 +1270,12 @@ const openAllPageTabsInBatches = async (page: Page, assignedStartPage: number, a
       const batchEnd = Math.min(batchStart + TABS_PER_BATCH - 1, assignedEndPage);
       const batchNumber = Math.ceil((batchStart - assignedStartPage) / TABS_PER_BATCH) + 1;
       
+      // Get current tab count (used for logging and cleanup decisions)
+      const currentTabCount = await countTotalOpenTabs();
+      
       // Check total open tabs - only close tabs in development mode
       // In production mode, keep all tabs open and refresh them instead
       if (isDevelopment) {
-        const currentTabCount = await countTotalOpenTabs();
         if (currentTabCount >= MAX_TABS_BEFORE_CLEANUP) {
           logger.info({ workerId, currentTabCount, maxTabs: MAX_TABS_BEFORE_CLEANUP, mode: "development" }, "⚠️ Reached tab limit (development mode), waiting for product workers to finish and closing completed batches...");
           
@@ -1310,7 +1312,6 @@ const openAllPageTabsInBatches = async (page: Page, assignedStartPage: number, a
         }
       } else {
         // Production mode: don't close tabs, just log the count
-        const currentTabCount = await countTotalOpenTabs();
         if (currentTabCount >= MAX_TABS_BEFORE_CLEANUP) {
           logger.info({ workerId, currentTabCount, maxTabs: MAX_TABS_BEFORE_CLEANUP, mode: "production" }, "⚠️ Reached tab limit (production mode), keeping tabs open for refresh cycle");
         }
