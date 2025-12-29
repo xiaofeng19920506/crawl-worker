@@ -1167,6 +1167,15 @@ const checkForDuplicateWorker = async (workerId: number): Promise<{ hasDuplicate
 const main = async (): Promise<void> => {
   const workerId = config.PRODUCT_WORKER_ID || 1;
   
+  // Clear any old page assignments on startup to prevent caching issues
+  try {
+    await redisConnection.del(REDIS_KEY_WORKER_PAGES(workerId));
+    logger.info({ workerId }, "Cleared old page assignments on startup");
+  } catch (error) {
+    logger.warn({ error, workerId }, "Failed to clear old page assignments on startup");
+  }
+  const workerId = config.PRODUCT_WORKER_ID || 1;
+  
   // Check for duplicate worker before starting
   const duplicateCheck = await checkForDuplicateWorker(workerId);
   if (duplicateCheck.hasDuplicate) {
