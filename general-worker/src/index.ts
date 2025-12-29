@@ -1324,11 +1324,11 @@ const openAllPageTabsInBatches = async (page: Page, assignedStartPage: number, a
       // Get current tab count (used for logging and cleanup decisions)
       const currentTabCount = await countTotalOpenTabs();
       
-      // Check total open tabs - only close tabs in development mode
-      // In production mode, keep all tabs open and refresh them instead
-      if (isDevelopment) {
+      // Check total open tabs - only close tabs when NOT using proxy
+      // When using proxy, keep all tabs open for loop crawling
+      if (!config.USE_PROXY) {
         if (currentTabCount >= MAX_TABS_BEFORE_CLEANUP) {
-          logger.info({ workerId, currentTabCount, maxTabs: MAX_TABS_BEFORE_CLEANUP, mode: "development" }, "⚠️ Reached tab limit (development mode), waiting for product workers to finish and closing completed batches...");
+          logger.info({ workerId, currentTabCount, maxTabs: MAX_TABS_BEFORE_CLEANUP, useProxy: false }, "⚠️ Reached tab limit (no proxy mode), waiting for product workers to finish and closing completed batches...");
           
           // Wait for product workers to complete current batches
           await waitForBatchCompletion();
@@ -1346,7 +1346,7 @@ const openAllPageTabsInBatches = async (page: Page, assignedStartPage: number, a
           
           // Re-check tab count after cleanup
           const tabCountAfterCleanup = await countTotalOpenTabs();
-          logger.info({ workerId, tabsBefore: currentTabCount, tabsAfter: tabCountAfterCleanup, closedTabs: closedTabCount }, "✅ Memory cleanup completed (development mode)");
+          logger.info({ workerId, tabsBefore: currentTabCount, tabsAfter: tabCountAfterCleanup, closedTabs: closedTabCount }, "✅ Memory cleanup completed (no proxy mode)");
         } else {
           // Even if we haven't reached the limit, close old completed batches periodically
           // This ensures we don't accumulate too many tabs
@@ -1354,17 +1354,17 @@ const openAllPageTabsInBatches = async (page: Page, assignedStartPage: number, a
           const completedBatches = batchContexts.filter(b => b.completed);
           if (completedBatches.length > 0 && currentTabCount > TABS_PER_BATCH * 2) {
             // If we have more than 2 batches worth of tabs, close old completed batches
-            logger.info({ workerId, currentTabCount, completedBatches: completedBatches.length, mode: "development" }, "Closing old completed batches to free memory...");
+            logger.info({ workerId, currentTabCount, completedBatches: completedBatches.length, useProxy: false }, "Closing old completed batches to free memory...");
             const closedTabCount = await closeCompletedBatches();
             if (closedTabCount > 0) {
-              logger.info({ workerId, closedTabs: closedTabCount, mode: "development" }, "✅ Closed old completed batches");
+              logger.info({ workerId, closedTabs: closedTabCount, useProxy: false }, "✅ Closed old completed batches");
             }
           }
         }
       } else {
-        // Production mode: don't close tabs, just log the count
+        // Proxy mode: don't close tabs, keep all tabs open for loop crawling
         if (currentTabCount >= MAX_TABS_BEFORE_CLEANUP) {
-          logger.info({ workerId, currentTabCount, maxTabs: MAX_TABS_BEFORE_CLEANUP, mode: "production" }, "⚠️ Reached tab limit (production mode), keeping tabs open for refresh cycle");
+          logger.info({ workerId, currentTabCount, maxTabs: MAX_TABS_BEFORE_CLEANUP, useProxy: true }, "⚠️ Reached tab limit (proxy mode), keeping tabs open for loop crawling");
         }
       }
       
@@ -1416,22 +1416,60 @@ const openAllPageTabsInBatches = async (page: Page, assignedStartPage: number, a
       await redisConnection.set(REDIS_KEY_CRAWL_TRIGGER, "1");
       logger.info({ workerId, batchStart, batchEnd }, "✅ Tabs ready - assigned pages and triggered product workers to crawl this batch (workers will crawl in parallel)");
       
-      // Close previous batch's context only in development mode
-      // In production mode, keep all contexts open for refresh cycle
+      // Close previous batch tabs when NOT using proxy (memory optimization)
+      // When using proxy, keep all batch tabs open for loop crawling
       // IMPORTANT: Only close tabs after product workers have finished crawling them
-      if (isDevelopment && previousBatchContext) {
+      if (!config.USE_PROXY && previousBatchContext) {
         // Wait for product workers to finish crawling the previous batch before closing tabs
         // This ensures we don't close tabs that are still being used by product workers
         (async () => {
           try {
             // Find the previous batch info
-            let prevBatch = batchContexts.find(b => b.context === previousBatchContext);
+            // IMPORTANT: When not using proxy, all batches share the same context,
+            // so we MUST find by batch range, not by context
+            let prevBatch: { batchStart: number; batchEnd: number; context: BrowserContext; completed: boolean } | undefined;
             
-            // If not found and not using proxy, find by batch range (since all share same context)
-            if (!prevBatch && !config.USE_PROXY) {
-              // Find the batch that was just before the current one
-              const previousBatchEnd = batchStart - 1;
-              prevBatch = batchContexts.find(b => b.batchEnd === previousBatchEnd);
+            // Always find by batch range first (more reliable)
+            // Find the batch that was just before the current one
+            const previousBatchEnd = batchStart - 1;
+            prevBatch = batchContexts.find(b => b.batchEnd === previousBatchEnd);
+            
+            // Log for debugging
+            logger.debug({ 
+              workerId, 
+              currentBatch: { start: batchStart, end: batchEnd },
+              lookingForBatchEnd: previousBatchEnd,
+              allBatches: batchContexts.map(b => ({ start: b.batchStart, end: b.batchEnd })),
+              foundBatch: prevBatch ? { start: prevBatch.batchStart, end: prevBatch.batchEnd } : null
+            }, "Searching for previous batch");
+            
+            // If not found by exact match, try to find the most recent batch before current batchStart
+            if (!prevBatch) {
+              const batchesBeforeCurrent = batchContexts.filter(b => b.batchEnd < batchStart);
+              if (batchesBeforeCurrent.length > 0) {
+                // Sort by batchEnd descending to get the most recent one
+                batchesBeforeCurrent.sort((a, b) => b.batchEnd - a.batchEnd);
+                prevBatch = batchesBeforeCurrent[0];
+                logger.info({ 
+                  workerId, 
+                  foundBatch: { start: prevBatch.batchStart, end: prevBatch.batchEnd },
+                  currentBatch: { start: batchStart, end: batchEnd },
+                  method: "fallback-search"
+                }, "Found previous batch by searching for most recent batch before current");
+              }
+            }
+            
+            // If using proxy, verify the context matches (each batch should have its own context)
+            if (config.USE_PROXY && config.PROXY_SERVER && prevBatch) {
+              if (prevBatch.context !== previousBatchContext) {
+                logger.warn({ 
+                  workerId,
+                  prevBatchContext: prevBatch.context ? "exists" : "null",
+                  previousBatchContext: previousBatchContext ? "exists" : "null",
+                  batchStart: prevBatch.batchStart,
+                  batchEnd: prevBatch.batchEnd
+                }, "Context mismatch - batch found by range but context doesn't match previousBatchContext");
+              }
             }
             
             if (!prevBatch || !previousBatchContext) {
@@ -1446,7 +1484,7 @@ const openAllPageTabsInBatches = async (page: Page, assignedStartPage: number, a
               workerId, 
               batchStart: prevBatchStart, 
               batchEnd: prevBatchEnd, 
-              mode: "development" 
+              useProxy: false
             }, "Waiting for product workers to finish crawling previous batch before closing tabs...");
             
             // Wait for product workers to complete the previous batch
@@ -1513,7 +1551,7 @@ const openAllPageTabsInBatches = async (page: Page, assignedStartPage: number, a
               workerId, 
               batchStart: prevBatchStart, 
               batchEnd: prevBatchEnd, 
-              mode: "development" 
+              useProxy: false
             }, "Attempting to close previous batch tabs...");
             
             try {
@@ -1522,7 +1560,7 @@ const openAllPageTabsInBatches = async (page: Page, assignedStartPage: number, a
                 workerId, 
                 batchStart: prevBatchStart, 
                 batchEnd: prevBatchEnd, 
-                mode: "development" 
+                useProxy: false
               }, "✅ Closed previous batch tabs");
             } catch (closeError: any) {
               const errorMsg = closeError instanceof Error ? closeError.message : String(closeError);
@@ -1535,30 +1573,9 @@ const openAllPageTabsInBatches = async (page: Page, assignedStartPage: number, a
               }, "Failed to close previous batch tabs");
             }
             
-            // Close the context after a delay to ensure workers finished (only if using proxy)
-            // If not using proxy, we're using the same context, so don't close it
-            if (config.USE_PROXY && config.PROXY_SERVER) {
-              const contextToClose = previousBatchContext; // Capture for closure
-              if (contextToClose) {
-                setTimeout(async () => {
-                  try {
-                    // Check if context is still accessible before closing
-                    try {
-                      contextToClose.pages();
-                      await contextToClose.close();
-                      logger.info({ workerId }, "✅ Closed previous batch context");
-                    } catch {
-                      logger.debug({ workerId }, "Previous batch context already closed or not accessible");
-                    }
-                  } catch (error: any) {
-                    const errorMsg = error instanceof Error ? error.message : String(error);
-                    logger.warn({ error: errorMsg }, "Failed to close previous batch context");
-                  }
-                }, 5000); // Wait 5 seconds before closing context
-              }
-            } else {
-              logger.debug({ workerId, mode: "development" }, "Not closing context (no proxy - using shared context)");
-            }
+            // When not using proxy, we're using the same shared context, so don't close it
+            // We only close the tabs, not the context itself
+            logger.debug({ workerId, useProxy: false }, "Not closing context (no proxy - using shared context, only tabs closed)");
           } catch (error: any) {
             const errorMsg = error instanceof Error ? error.message : String(error);
             const errorStack = error instanceof Error ? error.stack : undefined;
@@ -1586,8 +1603,8 @@ const openAllPageTabsInBatches = async (page: Page, assignedStartPage: number, a
     logger.info({ workerId }, "Waiting for final batch to complete...");
     await waitForBatchCompletion();
     
-    // Close the last batch's context only in development mode
-    if (isDevelopment && previousBatchContext) {
+    // Close the last batch's tabs only when NOT using proxy
+    if (!config.USE_PROXY && previousBatchContext) {
       const lastBatch = batchContexts[batchContexts.length - 1];
       if (lastBatch) {
         await closeBatchTabs(previousBatchContext, lastBatch.batchStart, lastBatch.batchEnd);
@@ -1596,29 +1613,29 @@ const openAllPageTabsInBatches = async (page: Page, assignedStartPage: number, a
         // If not using proxy, we're using the shared context, so don't close it
         if (config.USE_PROXY && config.PROXY_SERVER) {
           await previousBatchContext.close();
-          logger.info({ workerId, mode: "development" }, "✅ Closed final batch context");
+          logger.info({ workerId, useProxy: true }, "✅ Closed final batch context");
         } else {
-          logger.debug({ workerId, mode: "development" }, "Not closing final context (no proxy - using shared context)");
+          logger.debug({ workerId, useProxy: false }, "Not closing final context (no proxy - using shared context)");
         }
       }
     }
     
-    logger.info({ workerId, totalTabs: totalTabsOpened, totalPages: assignedEndPage - assignedStartPage + 1, mode: isProduction ? "production" : "development" }, "✅ All batches processed - all assigned page tabs opened and crawled");
+    logger.info({ workerId, totalTabs: totalTabsOpened, totalPages: assignedEndPage - assignedStartPage + 1, useProxy: config.USE_PROXY && config.PROXY_SERVER }, "✅ All batches processed - all assigned page tabs opened and crawled");
     
-    // Mark first loop as completed (for production mode refresh cycle)
+    // Mark first loop as completed (for proxy mode refresh cycle)
     if (onFirstLoopComplete) {
       onFirstLoopComplete();
     }
     
-    // In production mode, start refresh cycle after first loop
-    if (isProduction) {
-      logger.info({ workerId, mode: "production" }, "✅ First loop completed. Starting refresh cycle with proxy switching...");
+    // When using proxy, start refresh cycle after first loop (keep all tabs open)
+    if (config.USE_PROXY && config.PROXY_SERVER) {
+      logger.info({ workerId, useProxy: true }, "✅ First loop completed. Starting refresh cycle with proxy switching...");
       // Don't mark as complete - we'll continue with refresh cycle
       // The refresh cycle will be handled in the continuous check loop
     } else {
-      // Mark this general worker as complete in development mode
+      // Mark this general worker as complete when not using proxy (tabs are closed)
       await redisConnection.set(REDIS_KEY_GENERAL_WORKER_COMPLETE(workerId), "1");
-      logger.info({ workerId, mode: "development" }, "✅ General worker completed assigned page range");
+      logger.info({ workerId, useProxy: false }, "✅ General worker completed assigned page range");
       }
     } catch (error) {
     const currentWorkerId = config.GENERAL_WORKER_ID || 1;
