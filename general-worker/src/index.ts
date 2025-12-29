@@ -912,9 +912,11 @@ const closeBatchTabs = async (targetContext: BrowserContext, batchStart: number,
   logger.info({ workerId, batchStart, batchEnd }, "Closing tabs for completed batch");
   
   try {
-    // Check if context is closed before trying to access pages
-    if (targetContext.isClosed()) {
-      logger.warn({ workerId, batchStart, batchEnd }, "Context is already closed, cannot close tabs");
+    // Check if context is accessible (try to get pages to verify it's not closed)
+    try {
+      targetContext.pages();
+    } catch (error: any) {
+      logger.warn({ workerId, batchStart, batchEnd, error: error?.message || String(error) }, "Context is not accessible, cannot close tabs");
       return;
     }
     
@@ -1034,8 +1036,7 @@ const closeBatchTabs = async (targetContext: BrowserContext, batchStart: number,
         errorStack,
         workerId, 
         batchStart, 
-        batchEnd,
-        contextClosed: targetContext.isClosed() 
+        batchEnd
       }, "Error closing batch tabs");
       // Don't throw - continue to next batch even if closing fails
     }
@@ -1277,8 +1278,11 @@ const openAllPageTabsInBatches = async (page: Page, assignedStartPage: number, a
       let closedTabCount = 0;
       for (const batch of completedBatches) {
         try {
-          if (batch.context.isClosed()) {
-            // Context already closed, remove from tracking
+          // Check if context is accessible
+          try {
+            batch.context.pages();
+          } catch {
+            // Context is closed or not accessible, remove from tracking
             const index = batchContexts.findIndex(b => b.batchStart === batch.batchStart && b.batchEnd === batch.batchEnd);
             if (index !== -1) {
               batchContexts.splice(index, 1);
@@ -1304,8 +1308,7 @@ const openAllPageTabsInBatches = async (page: Page, assignedStartPage: number, a
             error: errorMessage, 
             errorStack,
             batchStart: batch.batchStart, 
-            batchEnd: batch.batchEnd,
-            contextClosed: batch.context.isClosed() 
+            batchEnd: batch.batchEnd
           }, "Failed to close completed batch");
         }
       }
@@ -1415,37 +1418,157 @@ const openAllPageTabsInBatches = async (page: Page, assignedStartPage: number, a
       
       // Close previous batch's context only in development mode
       // In production mode, keep all contexts open for refresh cycle
+      // IMPORTANT: Only close tabs after product workers have finished crawling them
       if (isDevelopment && previousBatchContext) {
-        // In development mode, always close previous batch (with or without proxy)
-        // Don't close immediately - let workers finish crawling
-        // We'll close it after a delay to ensure workers have started
-        setTimeout(async () => {
+        // Wait for product workers to finish crawling the previous batch before closing tabs
+        // This ensures we don't close tabs that are still being used by product workers
+        (async () => {
           try {
-            // Close tabs for the previous batch
-            const prevBatch = batchContexts.find(b => b.context === previousBatchContext);
-            if (prevBatch) {
-              await closeBatchTabs(previousBatchContext, prevBatch.batchStart, prevBatch.batchEnd);
-              logger.info({ workerId, batchStart: prevBatch.batchStart, batchEnd: prevBatch.batchEnd, mode: "development" }, "✅ Closed previous batch tabs");
+            // Find the previous batch info
+            let prevBatch = batchContexts.find(b => b.context === previousBatchContext);
+            
+            // If not found and not using proxy, find by batch range (since all share same context)
+            if (!prevBatch && !config.USE_PROXY) {
+              // Find the batch that was just before the current one
+              const previousBatchEnd = batchStart - 1;
+              prevBatch = batchContexts.find(b => b.batchEnd === previousBatchEnd);
+            }
+            
+            if (!prevBatch || !previousBatchContext) {
+              logger.warn({ workerId, batchStart, previousBatchContext: previousBatchContext ? "exists" : "null" }, "Previous batch not found in batchContexts, cannot close tabs");
+              return;
+            }
+            
+            const prevBatchStart = prevBatch.batchStart;
+            const prevBatchEnd = prevBatch.batchEnd;
+            
+            logger.info({ 
+              workerId, 
+              batchStart: prevBatchStart, 
+              batchEnd: prevBatchEnd, 
+              mode: "development" 
+            }, "Waiting for product workers to finish crawling previous batch before closing tabs...");
+            
+            // Wait for product workers to complete the previous batch
+            // Check REDIS_KEY_BATCH_COMPLETE flag - it's set to "1" when all workers finish
+            const maxWaitTime = 300000; // 5 minutes max wait
+            const checkInterval = 2000; // Check every 2 seconds
+            const startWaitTime = Date.now();
+            let batchComplete = false;
+            
+            while (!batchComplete && (Date.now() - startWaitTime) < maxWaitTime) {
+              const completeStr = await redisConnection.get(REDIS_KEY_BATCH_COMPLETE);
+              if (completeStr === "1") {
+                batchComplete = true;
+                logger.info({ 
+                  workerId, 
+                  batchStart: prevBatchStart, 
+                  batchEnd: prevBatchEnd 
+                }, "✅ Product workers finished crawling previous batch - safe to close tabs");
+                break;
+              }
               
-              // Close the context after a delay to ensure workers finished (only if using proxy)
-              // If not using proxy, we're using the same context, so don't close it
-              if (config.USE_PROXY && config.PROXY_SERVER) {
+              // Also check if all workers have no pages assigned (alternative completion check)
+              // Get active workers using the same detection method
+              const activeWorkers = await detectActiveWorkers();
+              
+              let allWorkersDone = true;
+              for (const workerId of activeWorkers) {
+                const pagesStr = await redisConnection.get(REDIS_KEY_WORKER_PAGES(workerId));
+                if (pagesStr) {
+                  const pages = JSON.parse(pagesStr) as number[];
+                  // Check if any pages in the previous batch range are still assigned
+                  const hasPreviousBatchPages = pages.some(p => p >= prevBatchStart && p <= prevBatchEnd);
+                  if (hasPreviousBatchPages) {
+                    allWorkersDone = false;
+                    break;
+                  }
+                }
+              }
+              
+              if (allWorkersDone) {
+                batchComplete = true;
+                logger.info({ 
+                  workerId, 
+                  batchStart: prevBatchStart, 
+                  batchEnd: prevBatchEnd 
+                }, "✅ All product workers finished crawling previous batch (no pages assigned) - safe to close tabs");
+                break;
+              }
+              
+              await delay(checkInterval);
+            }
+            
+            if (!batchComplete) {
+              logger.warn({ 
+                workerId, 
+                batchStart: prevBatchStart, 
+                batchEnd: prevBatchEnd,
+                waitTime: Date.now() - startWaitTime 
+              }, "Timeout waiting for product workers to finish - closing tabs anyway (may interrupt workers)");
+            }
+            
+            // Now close the tabs for the previous batch
+            logger.info({ 
+              workerId, 
+              batchStart: prevBatchStart, 
+              batchEnd: prevBatchEnd, 
+              mode: "development" 
+            }, "Attempting to close previous batch tabs...");
+            
+            try {
+              await closeBatchTabs(previousBatchContext, prevBatchStart, prevBatchEnd);
+              logger.info({ 
+                workerId, 
+                batchStart: prevBatchStart, 
+                batchEnd: prevBatchEnd, 
+                mode: "development" 
+              }, "✅ Closed previous batch tabs");
+            } catch (closeError: any) {
+              const errorMsg = closeError instanceof Error ? closeError.message : String(closeError);
+              const errorStack = closeError instanceof Error ? closeError.stack : undefined;
+              logger.warn({ 
+                error: errorMsg, 
+                errorStack,
+                batchStart: prevBatchStart, 
+                batchEnd: prevBatchEnd 
+              }, "Failed to close previous batch tabs");
+            }
+            
+            // Close the context after a delay to ensure workers finished (only if using proxy)
+            // If not using proxy, we're using the same context, so don't close it
+            if (config.USE_PROXY && config.PROXY_SERVER) {
+              const contextToClose = previousBatchContext; // Capture for closure
+              if (contextToClose) {
                 setTimeout(async () => {
                   try {
-                    await previousBatchContext.close();
-                    logger.info({ workerId }, "✅ Closed previous batch context");
-                  } catch (error) {
-                    logger.warn({ error }, "Failed to close previous batch context");
+                    // Check if context is still accessible before closing
+                    try {
+                      contextToClose.pages();
+                      await contextToClose.close();
+                      logger.info({ workerId }, "✅ Closed previous batch context");
+                    } catch {
+                      logger.debug({ workerId }, "Previous batch context already closed or not accessible");
+                    }
+                  } catch (error: any) {
+                    const errorMsg = error instanceof Error ? error.message : String(error);
+                    logger.warn({ error: errorMsg }, "Failed to close previous batch context");
                   }
                 }, 5000); // Wait 5 seconds before closing context
-              } else {
-                logger.debug({ workerId, mode: "development" }, "Not closing context (no proxy - using shared context)");
               }
+            } else {
+              logger.debug({ workerId, mode: "development" }, "Not closing context (no proxy - using shared context)");
             }
-          } catch (error) {
-            logger.warn({ error }, "Failed to close previous batch");
+          } catch (error: any) {
+            const errorMsg = error instanceof Error ? error.message : String(error);
+            const errorStack = error instanceof Error ? error.stack : undefined;
+            logger.warn({ 
+              error: errorMsg, 
+              errorStack,
+              batchStart 
+            }, "Failed to close previous batch");
           }
-        }, 2000); // Wait 2 seconds before starting to close previous batch
+        })(); // Immediately invoke async function (fire and forget)
       } else if (isProduction && previousBatchContext) {
         logger.debug({ workerId, mode: "production" }, "Keeping previous batch context open for refresh cycle");
       }
@@ -1496,8 +1619,8 @@ const openAllPageTabsInBatches = async (page: Page, assignedStartPage: number, a
       // Mark this general worker as complete in development mode
       await redisConnection.set(REDIS_KEY_GENERAL_WORKER_COMPLETE(workerId), "1");
       logger.info({ workerId, mode: "development" }, "✅ General worker completed assigned page range");
-    }
-  } catch (error) {
+      }
+    } catch (error) {
     const currentWorkerId = config.GENERAL_WORKER_ID || 1;
     logger.error({ error, workerId: currentWorkerId }, "Failed to open page tabs in batches");
     throw error;
