@@ -1711,6 +1711,10 @@ const main = async (): Promise<void> => {
   // Track if first loop is completed (for production mode refresh cycle)
   let firstLoopCompleted = false;
   
+  // Define environment mode flags (used in continuousCheck and openAllPageTabsInBatches)
+  const isDevelopment = config.NODE_ENV === "development";
+  const isProduction = config.NODE_ENV === "production";
+  
   // Start heartbeat loop - send heartbeat every 10 seconds
   const HEARTBEAT_INTERVAL = 10000; // 10 seconds
   const LOCK_TTL_SECONDS = 60; // Lock TTL matches the one used in checkForDuplicateWorker
