@@ -313,6 +313,14 @@ const saveSharedCookies = async (targetContext: BrowserContext): Promise<void> =
 
 const isSignedIn = async (page: Page): Promise<boolean> => {
   try {
+    const currentUrl = page.url();
+    
+    // First check: If we're on a sign-in page, we're definitely not logged in
+    if (currentUrl.includes("/ap/signin") || currentUrl.includes("/signin") || currentUrl.includes("/ap/register")) {
+      return false;
+    }
+    
+    // Second check: Look for account greeting (more reliable indicator)
     const accountGreeting = await page
       .locator("#nav-link-accountList-nav-line-1")
       .first()
@@ -320,24 +328,389 @@ const isSignedIn = async (page: Page): Promise<boolean> => {
       .catch(() => null);
 
     if (accountGreeting) {
-      const greeting = accountGreeting.toLowerCase();
-      if (greeting.includes("hello") || greeting.includes("hi") || greeting.includes("account")) {
-        return true;
+      const greeting = accountGreeting.toLowerCase().trim();
+      // If greeting contains "sign in", we're not logged in
+      if (greeting.includes("sign in")) {
+        return false;
       }
-      if (!greeting.includes("sign in") && greeting.length > 0) {
+      // If greeting has meaningful content (not empty, not just whitespace), we're likely logged in
+      if (greeting.length > 0 && (greeting.includes("hello") || greeting.includes("hi") || greeting.includes("account") || !greeting.includes("sign"))) {
         return true;
       }
     }
 
+    // Third check: Check if sign-in button/tooltip is visible (if visible, we're not logged in)
     const signInButton = page.locator("#nav-signin-tooltip");
     const signInVisible = await signInButton.isVisible({ timeout: 3000 }).catch(() => false);
-    if (!signInVisible) {
+    if (signInVisible) {
+      return false;
+    }
+
+    // Fourth check: Try to navigate to a protected page to verify
+    // If we can access vine page without redirect, we're logged in
+    if (currentUrl.includes("amazon.com/vine") && !currentUrl.includes("/ap/")) {
       return true;
     }
 
+    // Default: assume not logged in if we can't determine
     return false;
   } catch {
     return false;
+  }
+};
+
+/**
+ * Types text with human-like behavior (random delays between keystrokes)
+ */
+const humanType = async (page: Page, selector: string, text: string, options?: { minDelay?: number; maxDelay?: number }): Promise<void> => {
+  const minDelay = options?.minDelay ?? 50; // Minimum delay between keystrokes (ms)
+  const maxDelay = options?.maxDelay ?? 200; // Maximum delay between keystrokes (ms)
+  
+  // Clear the field first
+  await page.fill(selector, "");
+  await delay(100 + Math.random() * 100); // Small delay before typing
+  
+  // Type each character with random delays
+  for (let i = 0; i < text.length; i++) {
+    await page.type(selector, text[i], { delay: minDelay + Math.random() * (maxDelay - minDelay) });
+    
+    // Occasionally add a longer pause (simulating thinking or hesitation)
+    if (Math.random() < 0.1 && i < text.length - 1) {
+      await delay(200 + Math.random() * 300);
+    }
+  }
+  
+  // Final small delay after typing
+  await delay(100 + Math.random() * 200);
+};
+
+/**
+ * Automatically logs in to Amazon using credentials from .env
+ */
+const autoLogin = async (page: Page): Promise<void> => {
+  const workerId = config.GENERAL_WORKER_ID || 1;
+  
+  logger.info({ workerId }, "Starting automatic login...");
+  
+  // Navigate to Amazon sign-in page
+  try {
+    logger.info({ workerId, url: config.AMAZON_VINE_SIGNIN_URL }, "Navigating to Amazon sign-in page...");
+    await page.goto(config.AMAZON_VINE_SIGNIN_URL, {
+      waitUntil: "load",
+      timeout: 60000,
+    });
+    await delay(2000 + Math.random() * 1000); // Random delay 2-3 seconds
+  } catch (error) {
+    logger.error({ workerId, error }, "Failed to navigate to sign-in page");
+    throw new Error("Failed to navigate to sign-in page");
+  }
+  
+  // Check if already logged in
+  const alreadySignedIn = await isSignedIn(page);
+  if (alreadySignedIn) {
+    logger.info({ workerId }, "✅ Already logged in");
+    return;
+  }
+  
+  // Check if we're already on the password page (email already filled/remembered)
+  const passwordSelectors = [
+    'input[type="password"]',
+    'input[name="password"]',
+    'input[id="ap_password"]',
+    '#ap_password',
+  ];
+  
+  let isPasswordPage = false;
+  for (const selector of passwordSelectors) {
+    try {
+      const passwordField = page.locator(selector).first();
+      if (await passwordField.isVisible({ timeout: 3000 })) {
+        isPasswordPage = true;
+        logger.info({ workerId }, "Password page detected (email already filled/remembered), skipping email input");
+        break;
+      }
+    } catch {
+      continue;
+    }
+  }
+  
+  // Step 1: Enter email/phone (only if not on password page)
+  if (!isPasswordPage) {
+    try {
+      logger.info({ workerId }, "Entering email...");
+      
+      // Wait for email input field (Amazon uses different selectors)
+      const emailSelectors = [
+        'input[type="email"]',
+        'input[name="email"]',
+        'input[id="ap_email"]',
+        '#ap_email',
+      ];
+      
+      let emailField = null;
+      for (const selector of emailSelectors) {
+        try {
+          await page.waitForSelector(selector, { timeout: 5000 });
+          emailField = selector;
+          break;
+        } catch {
+          continue;
+        }
+      }
+      
+      if (!emailField) {
+        throw new Error("Could not find email input field");
+      }
+      
+      // Type email with human-like behavior
+      await humanType(page, emailField, config.AMAZON_EMAIL, { minDelay: 80, maxDelay: 250 });
+      await delay(500 + Math.random() * 500); // Pause before clicking continue
+      
+      // Click continue button
+      const continueSelectors = [
+        'input[type="submit"][id="continue"]',
+        '#continue',
+        'input[id="continue"]',
+        'button[type="submit"]',
+      ];
+      
+      let continueButton = null;
+      for (const selector of continueSelectors) {
+        try {
+          const button = page.locator(selector).first();
+          if (await button.isVisible({ timeout: 2000 })) {
+            continueButton = selector;
+            break;
+          }
+        } catch {
+          continue;
+        }
+      }
+      
+      if (!continueButton) {
+        throw new Error("Could not find continue button");
+      }
+      
+      await page.click(continueButton);
+      logger.info({ workerId }, "Clicked continue button");
+      await delay(2000 + Math.random() * 1000); // Wait for next page
+      
+    } catch (error) {
+      logger.error({ workerId, error }, "Failed to enter email");
+      throw error;
+    }
+  }
+  
+  // Step 2: Check for CAPTCHA or other challenges
+  const captchaSelectors = [
+    '#captchacharacters',
+    'input[name="captcha"]',
+    '.a-row.a-text-center',
+  ];
+  
+  let hasCaptcha = false;
+  for (const selector of captchaSelectors) {
+    try {
+      if (await page.locator(selector).isVisible({ timeout: 2000 })) {
+        hasCaptcha = true;
+        break;
+      }
+    } catch {
+      continue;
+    }
+  }
+  
+  if (hasCaptcha) {
+    logger.warn({ workerId }, "⚠️ CAPTCHA detected! Please solve it manually. Waiting 2 minutes...");
+    await delay(120000); // Wait 2 minutes for manual CAPTCHA solving
+  }
+  
+  // Step 3: Enter password
+  try {
+    logger.info({ workerId }, "Entering password...");
+    
+    // Wait for password input field (if we just clicked continue, wait a bit for page to load)
+    if (!isPasswordPage) {
+      await delay(1000 + Math.random() * 1000); // Wait for password page to load
+    }
+    
+    const passwordSelectors = [
+      'input[type="password"]',
+      'input[name="password"]',
+      'input[id="ap_password"]',
+      '#ap_password',
+    ];
+    
+    let passwordField = null;
+    for (const selector of passwordSelectors) {
+      try {
+        await page.waitForSelector(selector, { timeout: 10000 });
+        passwordField = selector;
+        break;
+      } catch {
+        continue;
+      }
+    }
+    
+    if (!passwordField) {
+      // Check if we're on a different page (e.g., 2FA)
+      const currentUrl = page.url();
+      if (currentUrl.includes("ap/mfa") || currentUrl.includes("ap/challenge")) {
+        logger.warn({ workerId, url: currentUrl }, "⚠️ 2FA or additional verification required! Please complete it manually. Waiting 2 minutes...");
+        await delay(120000); // Wait 2 minutes for manual 2FA
+      } else {
+        throw new Error("Could not find password input field");
+      }
+    } else {
+      // Type password with human-like behavior
+      await humanType(page, passwordField, config.AMAZON_PASSWORD, { minDelay: 100, maxDelay: 300 });
+      await delay(500 + Math.random() * 500); // Pause before clicking sign in
+      
+      // Click sign in button (try multiple selectors)
+      const signInSelectors = [
+        'input[type="submit"][id="signInSubmit"]',
+        '#signInSubmit',
+        'input[id="signInSubmit"]',
+        'button[type="submit"][id="signInSubmit"]',
+        'button[id="signInSubmit"]',
+        'input[type="submit"][value*="Sign"]',
+        'button[type="submit"]',
+      ];
+      
+      let signInButton = null;
+      for (const selector of signInSelectors) {
+        try {
+          const button = page.locator(selector).first();
+          if (await button.isVisible({ timeout: 2000 })) {
+            signInButton = selector;
+            break;
+          }
+        } catch {
+          continue;
+        }
+      }
+      
+      if (!signInButton) {
+        // Try to find by text content as fallback
+        try {
+          const signInByText = page.locator('button, input[type="submit"]').filter({ hasText: /sign.*in/i });
+          if (await signInByText.isVisible({ timeout: 2000 })) {
+            await signInByText.first().click();
+            logger.info({ workerId }, "Clicked sign in button (found by text)");
+            await delay(3000 + Math.random() * 2000); // Wait for login to complete
+            // Skip the rest of the button clicking logic
+            signInButton = "found_by_text";
+          }
+        } catch {
+          // Continue to throw error
+        }
+        
+        if (!signInButton) {
+          throw new Error("Could not find sign in button");
+        }
+      }
+      
+      if (signInButton !== "found_by_text") {
+        await page.click(signInButton);
+        logger.info({ workerId }, "Clicked sign in button");
+        await delay(3000 + Math.random() * 2000); // Wait for login to complete
+      }
+    }
+    
+  } catch (error) {
+    logger.error({ workerId, error }, "Failed to enter password");
+    throw error;
+  }
+  
+  // Step 4: Wait for login to complete and verify
+  logger.info({ workerId }, "Waiting for login to complete...");
+  
+  // Wait for page to navigate away from sign-in page (up to 30 seconds)
+  const MAX_LOGIN_WAIT = 30000;
+  const CHECK_INTERVAL = 1000;
+  const startTime = Date.now();
+  let leftSignInPage = false;
+  
+  while (Date.now() - startTime < MAX_LOGIN_WAIT) {
+    await delay(CHECK_INTERVAL);
+    
+    // Check if page was redirected or closed
+    if (page.isClosed()) {
+      throw new Error("Page was closed during login");
+    }
+    
+    const currentUrl = page.url();
+    
+    // Check if we've left the sign-in page
+    if (!currentUrl.includes("/ap/signin") && !currentUrl.includes("/signin") && !currentUrl.includes("/ap/register")) {
+      leftSignInPage = true;
+      logger.info({ workerId, url: currentUrl }, "Left sign-in page, verifying login...");
+      break;
+    }
+    
+    // Check for 2FA or additional verification
+    if (currentUrl.includes("ap/mfa") || currentUrl.includes("ap/challenge")) {
+      logger.warn({ workerId, url: currentUrl }, "⚠️ 2FA or additional verification required! Please complete it manually. Waiting 2 minutes...");
+      await delay(120000); // Wait 2 minutes for manual 2FA
+      leftSignInPage = true;
+      break;
+    }
+    
+    // Check for error messages on sign-in page
+    const errorSelectors = [
+      '.a-alert-error',
+      '#auth-error-message-box',
+      '.a-box-inner.a-alert-container',
+      '.a-alert-content',
+    ];
+    
+    for (const selector of errorSelectors) {
+      try {
+        if (await page.locator(selector).isVisible({ timeout: 500 })) {
+          const errorText = await page.locator(selector).textContent().catch(() => "");
+          if (errorText && errorText.trim().length > 0) {
+            logger.warn({ workerId, error: errorText }, "Login error detected");
+            throw new Error(`Login failed - ${errorText}`);
+          }
+        }
+      } catch (error) {
+        if (error instanceof Error && error.message.includes("Login failed")) {
+          throw error;
+        }
+        continue;
+      }
+    }
+  }
+  
+  if (!leftSignInPage) {
+    throw new Error("Login timeout - still on sign-in page after 30 seconds");
+  }
+  
+  // Wait a bit more for page to fully load
+  await delay(2000);
+  
+  // Navigate to encore queue to verify login
+  logger.info({ workerId }, "Verifying login by navigating to encore queue...");
+  try {
+    await page.goto(config.AMAZON_VINE_ENCORE_URL, {
+      waitUntil: "load",
+      timeout: 30000,
+    });
+    await delay(3000);
+    
+    // Final verification
+    const finalSignedIn = await isSignedIn(page);
+    const finalUrl = page.url();
+    
+    if (finalSignedIn && !finalUrl.includes("/ap/signin") && !finalUrl.includes("/signin")) {
+      logger.info({ workerId, url: finalUrl }, "✅ Automatic login successful and verified!");
+      return;
+    } else {
+      throw new Error(`Login verification failed - URL: ${finalUrl}, Signed in: ${finalSignedIn}`);
+    }
+  } catch (error) {
+    logger.error({ workerId, error }, "Failed to verify login");
+    throw error;
   }
 };
 
@@ -365,47 +738,91 @@ const ensureLoggedIn = async (page: Page): Promise<void> => {
   }
   
   // Navigate directly to encore queue to check login status
-  await navigateToEncoreQueue(page);
-
-  await delay(3000);
+  try {
+    await navigateToEncoreQueue(page);
+    await delay(3000);
+  } catch (error: any) {
+    // If session expired, we'll handle it with auto-login below
+    if (error?.message?.includes("Session expired")) {
+      logger.info({ workerId }, "Session expired detected, will attempt auto-login...");
+    } else {
+      throw error; // Re-throw other errors
+    }
+  }
 
   const signedIn = await isSignedIn(page);
   if (!signedIn) {
-    logger.warn({ currentUrl: page.url(), workerId }, "Not logged in. Waiting for manual login...");
-    logger.info({ workerId }, "Please log in manually in the browser window. The worker will wait and check periodically.");
+    logger.info({ currentUrl: page.url(), workerId }, "Not logged in. Attempting automatic login...");
     
-    // Wait for user to manually log in - check every 5 seconds
-    const MAX_WAIT_TIME = 300000; // 5 minutes max wait
-    const CHECK_INTERVAL = 5000; // Check every 5 seconds
-    const startTime = Date.now();
-    
-    while (Date.now() - startTime < MAX_WAIT_TIME) {
-      await delay(CHECK_INTERVAL);
+    try {
+      // Attempt automatic login (this will verify and navigate to encore queue)
+      await autoLogin(page);
       
-      // Check if page is still open
-      if (page.isClosed()) {
-        logger.error({ workerId }, "Page was closed while waiting for login");
-        throw new Error("Page was closed while waiting for manual login");
-      }
+      // autoLogin already verifies by navigating to encore queue, so we should be logged in now
+      // Double-check to be sure
+      await delay(2000);
+      const verifySignedIn = await isSignedIn(page);
+      const currentUrl = page.url();
       
-      // Re-check login status
-      const stillSignedIn = await isSignedIn(page);
-      if (stillSignedIn) {
-        logger.info({ workerId }, "✅ Manual login detected! Logged in successfully");
+      if (verifySignedIn && !currentUrl.includes("/ap/signin") && !currentUrl.includes("/signin")) {
+        logger.info({ workerId, url: currentUrl }, "✅ Automatic login successful and verified!");
         // Save cookies to Redis for other workers to use
         await saveSharedCookies(context);
         return; // Success - exit function
+      } else {
+        // If auto-login didn't fully work, wait for manual intervention (e.g., CAPTCHA, 2FA)
+        logger.warn({ workerId, url: currentUrl, signedIn: verifySignedIn }, "Auto-login completed but final verification failed. Waiting for manual intervention (CAPTCHA/2FA)...");
+        
+        const MAX_WAIT_TIME = 300000; // 5 minutes max wait
+        const CHECK_INTERVAL = 5000; // Check every 5 seconds
+        const startTime = Date.now();
+        
+        while (Date.now() - startTime < MAX_WAIT_TIME) {
+          await delay(CHECK_INTERVAL);
+          
+          // Check if page is still open
+          if (page.isClosed()) {
+            logger.error({ workerId }, "Page was closed while waiting for login");
+            throw new Error("Page was closed while waiting for login");
+          }
+          
+          // Try navigating to encore queue to verify
+          try {
+            await navigateToEncoreQueue(page);
+            await delay(2000);
+            const stillSignedIn = await isSignedIn(page);
+            const checkUrl = page.url();
+            
+            if (stillSignedIn && !checkUrl.includes("/ap/signin") && !checkUrl.includes("/signin")) {
+              logger.info({ workerId, url: checkUrl }, "✅ Login detected after manual intervention!");
+              // Save cookies to Redis for other workers to use
+              await saveSharedCookies(context);
+              return; // Success - exit function
+            }
+          } catch (navError) {
+            // If navigation fails due to session expired, continue waiting
+            if (navError instanceof Error && navError.message.includes("Session expired")) {
+              logger.debug({ workerId }, "Still waiting for login...");
+              continue;
+            }
+            throw navError;
+          }
+          
+          logger.debug({ workerId, elapsed: Date.now() - startTime }, "Still waiting for login completion...");
+        }
+        
+        // If we reach here, login didn't complete within the timeout
+        logger.error({ workerId, waitTime: MAX_WAIT_TIME }, "Timeout waiting for login completion");
+        throw new Error("Timeout waiting for login completion. Please check the browser and try again.");
       }
-      
-      logger.debug({ workerId, elapsed: Date.now() - startTime }, "Still waiting for manual login...");
+    } catch (error) {
+      logger.error({ workerId, error }, "Automatic login failed");
+      throw error;
     }
-    
-    // If we reach here, user didn't log in within the timeout
-    logger.error({ workerId, waitTime: MAX_WAIT_TIME }, "Timeout waiting for manual login");
-    throw new Error("Timeout waiting for manual login. Please ensure you log in within 5 minutes.");
   }
 
-  logger.info({ workerId }, "✅ Logged in successfully");
+  // If we reach here, we were already logged in
+  logger.info({ workerId }, "✅ Already logged in");
 
   // Save cookies to Redis for other workers to use
   await saveSharedCookies(context);
