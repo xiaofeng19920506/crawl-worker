@@ -392,17 +392,43 @@ const autoLogin = async (page: Page): Promise<void> => {
   
   logger.info({ workerId }, "Starting automatic login...");
   
-  // Navigate to Amazon sign-in page
-  try {
-    logger.info({ workerId, url: config.AMAZON_VINE_SIGNIN_URL }, "Navigating to Amazon sign-in page...");
-    await page.goto(config.AMAZON_VINE_SIGNIN_URL, {
-      waitUntil: "load",
-      timeout: 60000,
-    });
-    await delay(2000 + Math.random() * 1000); // Random delay 2-3 seconds
-  } catch (error) {
-    logger.error({ workerId, error }, "Failed to navigate to sign-in page");
-    throw new Error("Failed to navigate to sign-in page");
+  // Check if we're already on a sign-in page
+  const currentUrlBeforeNav = page.url();
+  const isAlreadyOnSignIn = currentUrlBeforeNav.includes("/ap/signin") || currentUrlBeforeNav.includes("/signin");
+  
+  if (isAlreadyOnSignIn) {
+    logger.info({ workerId, url: currentUrlBeforeNav }, "Already on sign-in page, using current page");
+    await delay(1000); // Small delay to ensure page is ready
+  } else {
+    // Navigate to Amazon sign-in page
+    try {
+      logger.info({ workerId, url: config.AMAZON_VINE_SIGNIN_URL }, "Navigating to Amazon sign-in page...");
+      await page.goto(config.AMAZON_VINE_SIGNIN_URL, {
+        waitUntil: "load",
+        timeout: 60000,
+      });
+      await delay(2000 + Math.random() * 1000); // Random delay 2-3 seconds
+    } catch (error) {
+      logger.error({ workerId, error }, "Failed to navigate to sign-in page");
+      throw new Error("Failed to navigate to sign-in page");
+    }
+  }
+  
+  // Check for 404 or other errors on the page
+  const currentUrlAfterNav = page.url();
+  const pageTitle = await page.title().catch(() => "");
+  const pageContent = await page.textContent("body").catch(() => "") || "";
+  
+  if (pageContent.includes("404") || pageContent.includes("Page Not Found") || pageTitle.includes("404")) {
+      logger.warn({ workerId, url: currentUrlAfterNav, title: pageTitle }, "⚠️ 404 error detected on sign-in page. Trying to reload or use alternative URL...");
+    
+    // Try to reload the page
+    try {
+      await page.reload({ waitUntil: "load", timeout: 30000 });
+      await delay(2000);
+    } catch (reloadError) {
+      logger.error({ workerId, error: reloadError }, "Failed to reload page");
+    }
   }
   
   // Check if already logged in
@@ -413,6 +439,9 @@ const autoLogin = async (page: Page): Promise<void> => {
   }
   
   // Check if we're already on the password page (email already filled/remembered)
+  const currentUrlForPasswordCheck = page.url();
+  logger.info({ workerId, url: currentUrlForPasswordCheck }, "Current page URL after navigation");
+  
   const passwordSelectors = [
     'input[type="password"]',
     'input[name="password"]',
@@ -421,17 +450,25 @@ const autoLogin = async (page: Page): Promise<void> => {
   ];
   
   let isPasswordPage = false;
+  logger.info({ workerId }, "Checking if already on password page...");
   for (const selector of passwordSelectors) {
     try {
       const passwordField = page.locator(selector).first();
-      if (await passwordField.isVisible({ timeout: 3000 })) {
+      const isVisible = await passwordField.isVisible({ timeout: 3000 });
+      logger.debug({ workerId, selector, isVisible }, "Password field visibility check");
+      if (isVisible) {
         isPasswordPage = true;
-        logger.info({ workerId }, "Password page detected (email already filled/remembered), skipping email input");
+        logger.info({ workerId, selector }, "✅ Password page detected (email already filled/remembered), skipping email input");
         break;
       }
-    } catch {
+    } catch (error) {
+      logger.debug({ workerId, selector, error: error instanceof Error ? error.message : String(error) }, "Password field check failed");
       continue;
     }
+  }
+  
+  if (!isPasswordPage) {
+    logger.info({ workerId }, "Not on password page, will enter email first");
   }
   
   // Step 1: Enter email/phone (only if not on password page)
@@ -439,27 +476,55 @@ const autoLogin = async (page: Page): Promise<void> => {
     try {
       logger.info({ workerId }, "Entering email...");
       
+      // Wait a bit for page to be ready
+      await delay(1000);
+      
+      // Check page state
+      const pageUrl = page.url();
+      const pageTitle = await page.title().catch(() => "");
+      logger.debug({ workerId, url: pageUrl, title: pageTitle }, "Page state before looking for email field");
+      
       // Wait for email input field (Amazon uses different selectors)
       const emailSelectors = [
         'input[type="email"]',
         'input[name="email"]',
         'input[id="ap_email"]',
         '#ap_email',
+        'input[autocomplete="email"]',
+        'input[autocomplete="username"]',
       ];
       
       let emailField = null;
+      logger.info({ workerId }, "Looking for email input field...");
       for (const selector of emailSelectors) {
         try {
-          await page.waitForSelector(selector, { timeout: 5000 });
-          emailField = selector;
-          break;
-        } catch {
+          logger.debug({ workerId, selector }, "Trying email selector...");
+          await page.waitForSelector(selector, { timeout: 5000, state: 'visible' });
+          const field = page.locator(selector).first();
+          const isVisible = await field.isVisible();
+          if (isVisible) {
+            emailField = selector;
+            logger.info({ workerId, selector }, "✅ Found email input field!");
+            break;
+          }
+        } catch (error) {
+          logger.debug({ workerId, selector, error: error instanceof Error ? error.message : String(error) }, "Email selector not found");
           continue;
         }
       }
       
       if (!emailField) {
-        throw new Error("Could not find email input field");
+        // Try to get page HTML snippet for debugging
+        const bodyText = await page.textContent("body").catch(() => "") || "";
+        const hasSignInText = bodyText.includes("Sign in") || bodyText.includes("sign in");
+        logger.error({ 
+          workerId, 
+          url: pageUrl, 
+          title: pageTitle,
+          hasSignInText,
+          bodyTextLength: bodyText.length 
+        }, "Could not find email input field");
+        throw new Error(`Could not find email input field on page: ${pageUrl}`);
       }
       
       // Type email with human-like behavior
@@ -531,23 +596,39 @@ const autoLogin = async (page: Page): Promise<void> => {
     
     // Wait for password input field (if we just clicked continue, wait a bit for page to load)
     if (!isPasswordPage) {
-      await delay(1000 + Math.random() * 1000); // Wait for password page to load
+      logger.info({ workerId }, "Waiting for password page to load after email submission...");
+      await delay(2000 + Math.random() * 1000); // Wait for password page to load
+    } else {
+      logger.info({ workerId }, "Already on password page, proceeding to enter password...");
+      await delay(1000); // Small delay to ensure page is ready
     }
+    
+    const currentUrlBeforePassword = page.url();
+    logger.info({ workerId, url: currentUrlBeforePassword }, "Current URL before password input");
     
     const passwordSelectors = [
       'input[type="password"]',
       'input[name="password"]',
       'input[id="ap_password"]',
       '#ap_password',
+      'input[autocomplete="current-password"]',
     ];
     
     let passwordField = null;
+    logger.info({ workerId }, "Looking for password input field...");
     for (const selector of passwordSelectors) {
       try {
-        await page.waitForSelector(selector, { timeout: 10000 });
-        passwordField = selector;
-        break;
-      } catch {
+        logger.debug({ workerId, selector }, "Trying password selector...");
+        await page.waitForSelector(selector, { timeout: 10000, state: 'visible' });
+        const field = page.locator(selector).first();
+        const isVisible = await field.isVisible();
+        if (isVisible) {
+          passwordField = selector;
+          logger.info({ workerId, selector }, "✅ Found password input field!");
+          break;
+        }
+      } catch (error) {
+        logger.debug({ workerId, selector, error: error instanceof Error ? error.message : String(error) }, "Password selector not found");
         continue;
       }
     }
@@ -555,18 +636,28 @@ const autoLogin = async (page: Page): Promise<void> => {
     if (!passwordField) {
       // Check if we're on a different page (e.g., 2FA)
       const currentUrl = page.url();
+      logger.warn({ workerId, url: currentUrl }, "Could not find password field, checking for 2FA or other challenges...");
       if (currentUrl.includes("ap/mfa") || currentUrl.includes("ap/challenge")) {
         logger.warn({ workerId, url: currentUrl }, "⚠️ 2FA or additional verification required! Please complete it manually. Waiting 2 minutes...");
         await delay(120000); // Wait 2 minutes for manual 2FA
       } else {
-        throw new Error("Could not find password input field");
+        // Try to get page HTML for debugging
+        const pageContent = await page.content().catch(() => "");
+        logger.error({ workerId, url: currentUrl, pageLength: pageContent.length }, "Could not find password input field");
+        throw new Error(`Could not find password input field on page: ${currentUrl}`);
       }
     } else {
       // Type password with human-like behavior
+      logger.info({ workerId, field: passwordField }, "Typing password with human-like behavior...");
+      if (!config.AMAZON_PASSWORD) {
+        throw new Error("AMAZON_PASSWORD is not set in environment variables");
+      }
       await humanType(page, passwordField, config.AMAZON_PASSWORD, { minDelay: 100, maxDelay: 300 });
+      logger.info({ workerId }, "✅ Password typed successfully");
       await delay(500 + Math.random() * 500); // Pause before clicking sign in
       
       // Click sign in button (try multiple selectors)
+      logger.info({ workerId }, "Looking for Sign In button...");
       const signInSelectors = [
         'input[type="submit"][id="signInSubmit"]',
         '#signInSubmit',
@@ -575,44 +666,70 @@ const autoLogin = async (page: Page): Promise<void> => {
         'button[id="signInSubmit"]',
         'input[type="submit"][value*="Sign"]',
         'button[type="submit"]',
+        'input[type="submit"]',
       ];
       
       let signInButton = null;
       for (const selector of signInSelectors) {
         try {
+          logger.debug({ workerId, selector }, "Trying sign in button selector...");
           const button = page.locator(selector).first();
-          if (await button.isVisible({ timeout: 2000 })) {
+          const isVisible = await button.isVisible({ timeout: 2000 });
+          if (isVisible) {
             signInButton = selector;
+            logger.info({ workerId, selector }, "✅ Found Sign In button!");
             break;
           }
-        } catch {
+        } catch (error) {
+          logger.debug({ workerId, selector, error: error instanceof Error ? error.message : String(error) }, "Sign in button selector not found");
           continue;
         }
       }
       
       if (!signInButton) {
         // Try to find by text content as fallback
+        logger.info({ workerId }, "Trying to find Sign In button by text content...");
         try {
           const signInByText = page.locator('button, input[type="submit"]').filter({ hasText: /sign.*in/i });
-          if (await signInByText.isVisible({ timeout: 2000 })) {
+          const isVisible = await signInByText.isVisible({ timeout: 2000 });
+          if (isVisible) {
             await signInByText.first().click();
-            logger.info({ workerId }, "Clicked sign in button (found by text)");
+            logger.info({ workerId }, "✅ Clicked sign in button (found by text)");
             await delay(3000 + Math.random() * 2000); // Wait for login to complete
             // Skip the rest of the button clicking logic
             signInButton = "found_by_text";
           }
-        } catch {
-          // Continue to throw error
+        } catch (error) {
+          logger.debug({ workerId, error: error instanceof Error ? error.message : String(error) }, "Could not find sign in button by text");
         }
         
         if (!signInButton) {
-          throw new Error("Could not find sign in button");
+          // Last resort: try to find any submit button
+          logger.warn({ workerId }, "Could not find Sign In button with standard selectors, trying last resort...");
+          try {
+            const anySubmitButton = page.locator('input[type="submit"], button[type="submit"]').first();
+            if (await anySubmitButton.isVisible({ timeout: 2000 })) {
+              const buttonText = await anySubmitButton.textContent().catch(() => "");
+              logger.info({ workerId, buttonText }, "Found submit button, clicking it...");
+              await anySubmitButton.click();
+              logger.info({ workerId }, "✅ Clicked submit button (last resort)");
+              await delay(3000 + Math.random() * 2000);
+              signInButton = "found_by_last_resort";
+            }
+          } catch (error) {
+            logger.error({ workerId, error: error instanceof Error ? error.message : String(error) }, "Could not find any submit button");
+          }
+          
+          if (!signInButton) {
+            throw new Error("Could not find sign in button");
+          }
         }
       }
       
-      if (signInButton !== "found_by_text") {
+      if (signInButton !== "found_by_text" && signInButton !== "found_by_last_resort") {
+        logger.info({ workerId, selector: signInButton }, "Clicking Sign In button...");
         await page.click(signInButton);
-        logger.info({ workerId }, "Clicked sign in button");
+        logger.info({ workerId }, "✅ Clicked sign in button");
         await delay(3000 + Math.random() * 2000); // Wait for login to complete
       }
     }
@@ -724,16 +841,27 @@ const ensureLoggedIn = async (page: Page): Promise<void> => {
   if (cookiesLoaded) {
     // Try navigating with shared cookies
     logger.info({ workerId }, "Using shared cookies, checking if session is valid...");
-    await navigateToEncoreQueue(page);
-    await delay(3000);
-    
-    const signedIn = await isSignedIn(page);
-    if (signedIn) {
-      logger.info({ workerId }, "✅ Logged in successfully using shared cookies");
-      return; // Success with shared cookies
-    } else {
-      logger.warn({ workerId }, "Shared cookies invalid, will login normally");
-      await redisConnection.set(REDIS_KEY_AMAZON_SESSION_VALID, "0"); // Mark session as invalid
+    try {
+      await navigateToEncoreQueue(page);
+  await delay(3000);
+      
+      const signedIn = await isSignedIn(page);
+      if (signedIn) {
+        logger.info({ workerId }, "✅ Logged in successfully using shared cookies");
+        return; // Success with shared cookies
+      } else {
+        logger.warn({ workerId }, "Shared cookies invalid, will login normally");
+        await redisConnection.set(REDIS_KEY_AMAZON_SESSION_VALID, "0"); // Mark session as invalid
+      }
+    } catch (error: any) {
+      // If session expired with shared cookies, mark as invalid and proceed to auto-login
+      if (error?.message?.includes("Session expired")) {
+        logger.warn({ workerId, error: error.message }, "Shared cookies session expired, will attempt auto-login...");
+        await redisConnection.set(REDIS_KEY_AMAZON_SESSION_VALID, "0"); // Mark session as invalid
+      } else {
+        // For other errors, log and continue to normal login flow
+        logger.warn({ workerId, error: error.message }, "Error checking shared cookies, will login normally");
+      }
     }
   }
   
@@ -2213,8 +2341,8 @@ const openAllPageTabsInBatches = async (page: Page, assignedStartPage: number, a
       // Mark this general worker as complete when not using proxy (tabs are closed)
       await redisConnection.set(REDIS_KEY_GENERAL_WORKER_COMPLETE(workerId), "1");
       logger.info({ workerId, useProxy: false }, "✅ General worker completed assigned page range");
-    }
-  } catch (error) {
+      }
+    } catch (error) {
     const currentWorkerId = config.GENERAL_WORKER_ID || 1;
     logger.error({ error, workerId: currentWorkerId }, "Failed to open page tabs in batches");
     throw error;
